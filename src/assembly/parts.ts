@@ -8,6 +8,8 @@ export interface PartMesh {
   body: string;
   /** "Part 1", as the Part Studio's Parts list calls it. */
   label: string;
+  /** The kernel's own name for the body, such as f1, which `body` isn't for a studio with one part. */
+  kernel: string;
   positions: Float32Array;
   normals: Float32Array;
   faceIds: Uint32Array;
@@ -67,6 +69,7 @@ export function splitParts(m: MeshData, faces: FaceData[], edges: EdgeData[]): P
     out.push({
       body: partFaces.find((f) => f?.body)?.body ?? `part${partIndex}`,
       label: `Part ${partIndex + 1}`,
+      kernel: part.name,
       positions: new Float32Array(positions),
       normals: new Float32Array(normals),
       faceIds: new Uint32Array(faceIds),

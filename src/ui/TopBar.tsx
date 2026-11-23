@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from 'solid-js';
+import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { command } from '../commands';
 import { activeDef } from '../features/dialog';
 import { cancelSketch, finishSketch, session } from '../sketch/controller';
@@ -6,9 +6,14 @@ import type { SketchSession, Tool } from '../sketch/session';
 import { MATE_TYPES } from '../assembly/model';
 import { AssemblyStatus } from '../assembly/ui';
 import { doc, setTitle, UNTITLED } from '../store/doc';
-import { inAssembly } from '../store/tabs';
+import { inAssembly, inDrawing } from '../store/tabs';
+import { DrawingTools } from '../drawing/ui';
+import { flatOpen } from '../store/sheetmetal';
+import { section } from '../store/section';
+import { massOpen } from './MassPanel';
 import { mode, setPaletteOpen, snapsOn, toggleSnaps } from '../store/ui';
 import { closeOnEscape } from './ContextMenu';
+import { versionsOpen } from '../store/versions';
 import { Icon } from './icons';
 
 /** A finished sketch nothing has used yet: the obvious next step is to extrude it. */
@@ -17,10 +22,11 @@ function sketchWaiting() {
   return !!last && last.type === 'constrained_sketch' && !activeDef();
 }
 
-function ToolButton(props: { id: string }) {
+/** With `held`, a button that shows something stays pressed in while it's on show. */
+function ToolButton(props: { id: string; held?: () => boolean }) {
   const c = command(props.id);
   return (
-    <button class="tool" classList={{ suggested: props.id === 'extrude' && sketchWaiting() }} aria-label={c.title} data-tip={c.title} data-keys={c.keys} disabled={c.enabled ? !c.enabled() : false} onClick={() => void c.run()} data-command={c.id}>
+    <button class="tool" classList={{ suggested: props.id === 'extrude' && sketchWaiting(), held: !!props.held?.() }} aria-pressed={props.held ? props.held() : undefined} aria-label={c.title} data-tip={c.title} data-keys={c.keys} disabled={c.enabled ? !c.enabled() : false} onClick={() => void c.run()} data-command={c.id}>
       <Icon name={c.icon} />
     </button>
   );
@@ -29,11 +35,11 @@ function ToolButton(props: { id: string }) {
 type MenuEntry = string | { heading: string } | null;
 const APP_MENU: MenuEntry[] = [
   { heading: 'File' },
-  'new', 'tab.assembly', 'tab.folder', null, 'open', 'save', null, 'import', 'export.step', 'export.stl', null, 'example',
+  'new', 'tab.assembly', 'tab.drawing', 'tab.folder', null, 'open', 'save', null, 'versions', 'save.document', 'open.document', null, 'import', 'export.step', 'export.stl', 'export.dxf', null, 'example',
   { heading: 'Edit' },
   'undo', 'redo', 'palette',
   { heading: 'View' },
-  'fit', 'view.normal', 'view.planes', 'view.sketches', 'tab.manager',
+  'fit', 'view.normal', 'view.planes', 'view.sketches', 'view.section', 'mass', 'tab.manager',
   { heading: 'Help' },
   'shortcuts',
 ];
@@ -105,12 +111,20 @@ const DRAW_TOOLS: SketchTool[] = [
   { tool: 'arc', icon: 'arc', label: '3-point arc', key: 'A' },
   { tool: 'arc-center', icon: 'arc-center', label: 'Center arc', key: 'Shift A' },
   { tool: 'arc-tangent', icon: 'arc-tangent', label: 'Tangent arc', key: 'Shift T' },
+  { tool: 'slot', icon: 'slot', label: 'Straight slot', key: 'O' },
+  { tool: 'polygon', icon: 'polygon', label: 'Inscribed polygon', key: 'Shift P' },
   { tool: 'spline', icon: 'spline', label: 'Spline', key: 'S' },
   { tool: 'point', icon: 'point', label: 'Point', key: 'P' },
+  { tool: 'text', icon: 'text', label: 'Text', key: 'Shift W' },
 ];
 const EDIT_TOOLS: SketchTool[] = [
   { tool: 'trim', icon: 'trim', label: 'Trim', key: 'T' },
+  { tool: 'extend', icon: 'extend', label: 'Extend', key: 'Shift X' },
   { tool: 'sketch-fillet', icon: 'sketch-fillet', label: 'Round a corner', key: 'Shift F' },
+  { tool: 'offset', icon: 'sketch-offset', label: 'Offset', key: 'Shift O' },
+  { tool: 'mirror', icon: 'mirror', label: 'Mirror', key: 'Shift M' },
+  { tool: 'sketch-linear', icon: 'sketch-linear', label: 'Linear pattern', key: '' },
+  { tool: 'sketch-circular', icon: 'sketch-circular', label: 'Circular pattern', key: '' },
 ];
 
 const CONSTRAINTS: { type: string; icon: string; label: string; key?: string }[] = [
@@ -177,6 +191,109 @@ function SketchTools(props: { session: SketchSession }) {
   );
 }
 
+interface ToolGroup { label: string; ids: string[] }
+const PART_GROUPS: ToolGroup[] = [
+  { label: 'Sketch and planes', ids: ['sketch', 'plane'] },
+  { label: 'Make solids', ids: ['extrude', 'revolve', 'sweep', 'loft', 'helix'] },
+  { label: 'Edges and faces', ids: ['fillet', 'chamfer', 'draft', 'rib', 'shell', 'hole'] },
+  { label: 'Faces', ids: ['offset', 'thicken', 'delete-face', 'copy-faces'] },
+  { label: 'Copy and move', ids: ['mirror', 'pattern-linear', 'pattern-circular', 'transform'] },
+  { label: 'Parts', ids: ['boolean', 'split', 'delete-bodies'] },
+  { label: 'Surfaces', ids: ['fill', 'sew', 'trim-surface'] },
+  { label: 'Sheet metal', ids: ['sheet-metal', 'flange', 'hem', 'tab', 'bend', 'flat-pattern'] },
+  { label: 'Inspect', ids: ['view.section', 'mass'] },
+];
+/** Tools that show something stay pressed in while it's on show. */
+const HELD: Record<string, () => boolean> = { 'flat-pattern': flatOpen, 'view.section': () => !!section(), mass: massOpen };
+
+/**
+ * A row of tool groups. Groups that don't fit go, from the end, into a menu at the end of the row, as Onshape's toolbar
+ * does, so no tool is ever out of reach.
+ */
+function ToolRow(props: { label: string; groups: ToolGroup[] }) {
+  let row!: HTMLDivElement;
+  const [fits, setFits] = createSignal(props.groups.length);
+  const [menuAt, setMenuAt] = createSignal<{ x: number; y: number } | null>(null);
+  let widths: number[] = [];
+  const measure = () => {
+    const els = [...row.querySelectorAll<HTMLElement>(':scope > .tool-group')];
+    // Widths are taken once, with every group on show, since a hidden one has none.
+    if (widths.length !== els.length || widths.some((w) => !w)) widths = els.map((e) => e.offsetWidth);
+    const room = row.clientWidth;
+    const more = 34;
+    let used = 0;
+    let n = 0;
+    for (const w of widths) {
+      const last = n === widths.length - 1;
+      if (used + w + (last ? 0 : more) > room) break;
+      used += w;
+      n++;
+    }
+    setFits(n);
+  };
+  onMount(() => {
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(row);
+    onCleanup(() => ro.disconnect());
+    requestAnimationFrame(measure);
+  });
+  const hidden = () => props.groups.slice(fits());
+  let moreButton!: HTMLButtonElement;
+  closeOnEscape(() => !!menuAt(), () => setMenuAt(null));
+  return (
+    <div class="tools" role="toolbar" aria-label={props.label} ref={row}>
+      <For each={props.groups}>
+        {(g, i) => (
+          <div class="tool-group" role="group" aria-label={g.label} style={i() >= fits() ? { display: 'none' } : undefined}>
+            <For each={g.ids}>{(id) => <ToolButton id={id} held={HELD[id]} />}</For>
+          </div>
+        )}
+      </For>
+      <Show when={hidden().length}>
+        <div class="tool-group">
+          <button
+            ref={moreButton}
+            class="tool"
+            aria-label="More tools"
+            data-tip="More tools"
+            aria-haspopup="menu"
+            aria-expanded={!!menuAt()}
+            data-testid="more-tools"
+            onClick={() => { const b = moreButton.getBoundingClientRect(); setMenuAt(menuAt() ? null : { x: Math.min(b.left, window.innerWidth - 230), y: b.bottom + 4 }); }}
+          >
+            <Icon name="caret" />
+          </button>
+        </div>
+      </Show>
+      <Show when={menuAt()}>
+        {(at) => (
+          <>
+            <div class="menu-scrim" onPointerDown={() => setMenuAt(null)} />
+            <div class="menu" role="menu" style={{ left: `${at().x}px`, top: `${at().y}px` }}>
+              <For each={hidden()}>
+                {(g, i) => (
+                  <>
+                    <Show when={i() > 0}><div class="menu-rule" role="separator" /></Show>
+                    <div class="menu-heading">{g.label}</div>
+                    <For each={g.ids.map(command)}>
+                      {(c) => (
+                        <button role="menuitem" disabled={c.enabled ? !c.enabled() : false} onClick={() => { setMenuAt(null); void c.run(); }} data-command={c.id}>
+                          <span class="menu-label"><Icon name={c.icon} /><span class="menu-tool-name">{c.title}</span></span>
+                          <Show when={c.keys}><kbd>{c.keys}</kbd></Show>
+                        </button>
+                      )}
+                    </For>
+                  </>
+                )}
+              </For>
+            </div>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}
+
 export function TopBar() {
   const c = (id: string) => command(id);
   return (
@@ -187,22 +304,17 @@ export function TopBar() {
         <input class="title" value={doc.title} aria-label="Document name" spellcheck={false} onChange={(e) => setTitle(e.currentTarget.value.trim() || UNTITLED)} onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') e.currentTarget.blur(); }} />
         <button class="tool" aria-label="Undo" data-tip="Undo" data-keys="Ctrl Z" disabled={!c('undo').enabled!()} onClick={() => void c('undo').run()}><Icon name="undo" /></button>
         <button class="tool" aria-label="Redo" data-tip="Redo" data-keys="Ctrl Shift Z" disabled={!c('redo').enabled!()} onClick={() => void c('redo').run()}><Icon name="redo" /></button>
+        <button class="tool" classList={{ on: versionsOpen() }} aria-label="Versions" data-tip="Versions" data-testid="versions-button" disabled={!c('versions').enabled!()} onClick={() => void c('versions').run()}><Icon name="versions" /></button>
       </div>
-      <Show when={session()} keyed fallback={inAssembly() ? (
+      <Show when={session()} keyed fallback={inDrawing() ? <DrawingTools /> : inAssembly() ? (
         <div class="tools" role="toolbar" aria-label="Assembly tools">
           <div class="tool-group"><ToolButton id="asm.insert" /></div>
           <div class="tool-group"><For each={MATE_TYPES}>{(t) => <ToolButton id={`asm.mate.${t}`} />}</For></div>
+          <div class="tool-group"><ToolButton id="asm.pattern.linear" /><ToolButton id="asm.pattern.circular" /><ToolButton id="asm.replicate" /></div>
+          <div class="tool-group"><ToolButton id="asm.explode" /><ToolButton id="asm.position" /></div>
         </div>
       ) : (
-        <div class="tools" role="toolbar" aria-label="Modelling tools">
-          <div class="tool-group"><ToolButton id="sketch" /></div>
-          <div class="tool-group"><ToolButton id="extrude" /><ToolButton id="revolve" /><ToolButton id="sweep" /><ToolButton id="loft" /><ToolButton id="helix" /></div>
-          <div class="tool-group"><ToolButton id="fillet" /><ToolButton id="chamfer" /><ToolButton id="shell" /><ToolButton id="draft" /></div>
-          <div class="tool-group"><ToolButton id="offset" /><ToolButton id="thicken" /><ToolButton id="delete-face" /><ToolButton id="copy-faces" /></div>
-          <div class="tool-group"><ToolButton id="mirror" /><ToolButton id="pattern-linear" /><ToolButton id="pattern-circular" /><ToolButton id="transform" /></div>
-          <div class="tool-group"><ToolButton id="boolean" /><ToolButton id="delete-bodies" /></div>
-          <div class="tool-group"><ToolButton id="fill" /><ToolButton id="sew" /><ToolButton id="trim-surface" /></div>
-        </div>
+        <ToolRow label="Modelling tools" groups={PART_GROUPS} />
       )}>
         {(active) => (
           <div class="tools sketch-tools">

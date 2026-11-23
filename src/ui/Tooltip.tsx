@@ -35,7 +35,7 @@ export function Tooltip() {
   return (
     <Show when={tip()}>
       {(t) => (
-        <div class="tooltip" role="tooltip" style={{ left: `${t().x}px`, top: `${t().y}px` }}>
+        <div class="tooltip" classList={{ long: t().text.length > 90 || t().text.includes('\n') }} role="tooltip" style={{ left: `${t().x}px`, top: `${t().y}px` }}>
           {t().text}
           <Show when={t().keys}><kbd>{t().keys}</kbd></Show>
         </div>

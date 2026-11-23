@@ -528,7 +528,7 @@ await addSketch(rect(50, 0, 10, 10, 1), 'Profile', 0);
 await settle(300);
 await addSketch(rect(50, 0, 6, 6, 1), 'Higher', 40);
 await settle(300);
-for (const id of ['extrude', 'revolve', 'sweep', 'loft', 'helix', 'fillet', 'chamfer', 'shell', 'draft', 'offset', 'thicken', 'delete-face', 'copy-faces', 'mirror', 'pattern-linear', 'pattern-circular', 'transform', 'delete-bodies', 'fill']) {
+for (const id of ['extrude', 'revolve', 'sweep', 'loft', 'helix', 'fillet', 'chamfer', 'shell', 'draft', 'offset', 'thicken', 'delete-face', 'copy-faces', 'mirror', 'pattern-linear', 'pattern-circular', 'transform', 'delete-bodies', 'fill', 'plane', 'sheet-metal']) {
   await cmd(id);
   await settle(600);
   const present = !!(await page.$('[data-testid=dialog]'));

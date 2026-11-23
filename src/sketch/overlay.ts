@@ -47,7 +47,7 @@ function strokeEntity(ctx: CanvasRenderingContext2D, s: SketchSession, e: Ent, f
   const key = String(e.id);
   const pts = polyline(e);
   if (!pts.length) return;
-  const on = selected.has(key), over = s.hover === key;
+  const on = selected.has(key), over = s.hover === key || s.offsetHover.includes(e.id);
   const shown = drawn(e);
   ctx.strokeStyle = on ? MARKER : over ? MARKER_SOFT : isProjected(e) ? LINKED : entityFree(e, free) ? LOOSE : INK;
   ctx.lineWidth = on || over ? 1.75 : 1.25;
@@ -55,6 +55,27 @@ function strokeEntity(ctx: CanvasRenderingContext2D, s: SketchSession, e: Ent, f
   path(ctx, s, pts);
   ctx.stroke();
   ctx.setLineDash([]);
+}
+
+/** Each text's letters, as the kernel sets them, and a box round it while it's picked or under the pointer. */
+function drawTexts(ctx: CanvasRenderingContext2D, s: SketchSession, selected: Set<string>) {
+  for (const t of s.texts()) {
+    const key = String(t.id);
+    const on = selected.has(key), over = s.hover === key;
+    ctx.strokeStyle = on ? MARKER : over ? MARKER_SOFT : INK;
+    ctx.lineWidth = on || over ? 1.5 : 1.1;
+    for (const piece of s.textOutlines.get(t.id) ?? []) {
+      path(ctx, s, piece);
+      ctx.stroke();
+    }
+    if (!on && !over) continue;
+    const b = s.textBox(t);
+    if (!b) continue;
+    ctx.setLineDash([3, 3]);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(b.x0 - 3, b.y0 - 3, b.x1 - b.x0 + 6, b.y1 - b.y0 + 6);
+    ctx.setLineDash([]);
+  }
 }
 
 function dot(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, color: string) {
@@ -134,7 +155,7 @@ function drawGlyphs(ctx: CanvasRenderingContext2D, s: SketchSession, selected: S
     return [(-dy / l) * 14, (dx / l) * 14];
   };
   for (const c of s.data.constraints) {
-    if (c.value !== undefined || c.type === 'coincident') continue;
+    if (c.value !== undefined || c.type === 'coincident' || s.conHidden(c)) continue;
     const key = `c${c.id}`;
     const refs = c.type === 'midpoint' ? [c.line] : c.type === 'fix' ? [c.what] : c.type === 'symmetric' ? [c.about] : c.type === 'tangent' ? [c.a] : [c.a, c.b];
     for (const ref of refs) {
@@ -336,6 +357,31 @@ function drawDraftShape(ctx: CanvasRenderingContext2D, s: SketchSession) {
       path(ctx, s, arcPoints(d.c, dist2(d.c, d.s), angleOf(d.c, d.s), angleOf(d.c, end)));
       ctx.stroke();
     }
+  } else if (d.kind === 'slot') {
+    const shape = d.b ? s.slotShape(d.a, d.b, end) : null;
+    if (!d.b || !shape) {
+      path(ctx, s, [d.a, d.b ?? end]);
+      ctx.stroke();
+      const a = s.screen(d.a), b = s.screen(d.b ?? end);
+      readout(ctx, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2 - 15, fmt(dist2(d.a, d.b ?? end)));
+    } else {
+      const ta = angleOf(d.a, shape.a1), tb = angleOf(d.b, shape.b2);
+      path(ctx, s, [...arcPoints(d.b, shape.r, tb, tb + Math.PI), ...arcPoints(d.a, shape.r, ta, ta + Math.PI), shape.b2]);
+      ctx.stroke();
+      const e = s.screen(end);
+      readout(ctx, e[0] + 26, e[1] - 14, `${fmt(shape.r * 2)} wide`);
+    }
+  } else if (d.kind === 'polygon') {
+    const n = s.polygonSides[0]();
+    const pts = s.polygonCorners(d.c, end, n);
+    path(ctx, s, [...pts, pts[0]]);
+    ctx.stroke();
+    ctx.setLineDash([4, 4]);
+    path(ctx, s, arcPoints(d.c, dist2(d.c, end), 0, Math.PI * 2));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const e = s.screen(end);
+    readout(ctx, e[0] + 30, e[1] - 14, `${n} sides`);
   } else if (d.kind === 'dim') {
     // The real dimension, with its current value, following the cursor until it's placed.
     const m = s.dimensionPreview();
@@ -343,6 +389,26 @@ function drawDraftShape(ctx: CanvasRenderingContext2D, s: SketchSession) {
     if (m && layout) {
       drawLayout(ctx, s, layout, MARKER);
       drawLabel(ctx, s, layout.label, dimLabelText(m), MARKER);
+    }
+  } else if (d.kind === 'offset') {
+    const o = s.offsetPreview();
+    if (o && typeof o !== 'string') {
+      for (const e of o.ents) {
+        path(ctx, s, polyline(e as Ent));
+        ctx.stroke();
+      }
+      const at = s.screen(s.cursor);
+      readout(ctx, at[0] + 30, at[1] - 14, fmt(Math.abs(o.d)));
+    } else if (typeof o === 'string') {
+      const at = s.screen(s.cursor);
+      readout(ctx, at[0] + 30, at[1] - 14, 'Too far');
+    }
+    for (const c of d.chains) for (const l of c.links) {
+      ctx.save();
+      ctx.lineWidth = 1.75;
+      path(ctx, s, polyline(l.e));
+      ctx.stroke();
+      ctx.restore();
     }
   } else if (d.kind === 'box') {
     const x = Math.min(d.a[0], d.b[0]), y = Math.min(d.a[1], d.b[1]);
@@ -434,6 +500,46 @@ function drawSnap(ctx: CanvasRenderingContext2D, s: SketchSession) {
   });
 }
 
+function drawExtend(ctx: CanvasRenderingContext2D, s: SketchSession) {
+  if (!s.extending) return;
+  ctx.strokeStyle = MARKER;
+  ctx.lineWidth = 1.75;
+  ctx.setLineDash([5, 4]);
+  path(ctx, s, s.extending);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/** A pattern's copies as they'd come out, and the point a circular one turns about. */
+function drawPattern(ctx: CanvasRenderingContext2D, s: SketchSession) {
+  const p = s.pattern[0]();
+  if (!p) return;
+  ctx.strokeStyle = MARKER;
+  ctx.lineWidth = 1.25;
+  ctx.setLineDash([5, 3]);
+  for (const e of s.patternCopies()) {
+    const pts = polyline(e as Ent);
+    if (pts.length) {
+      path(ctx, s, pts);
+      ctx.stroke();
+    } else if (e.at) {
+      const [x, y] = s.screen(e.at);
+      dot(ctx, x, y, 2.4, MARKER);
+    }
+  }
+  ctx.setLineDash([]);
+  if (p.kind === 'circular') {
+    const [x, y] = s.screen(p.centerAt);
+    ctx.strokeStyle = MARKER;
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.arc(x, y, 6, 0, Math.PI * 2);
+    ctx.moveTo(x - 9, y); ctx.lineTo(x + 9, y);
+    ctx.moveTo(x, y - 9); ctx.lineTo(x, y + 9);
+    ctx.stroke();
+  }
+}
+
 function drawTrim(ctx: CanvasRenderingContext2D, s: SketchSession) {
   if (!s.trimming) return;
   ctx.strokeStyle = MARKER;
@@ -484,10 +590,12 @@ export function drawSketch(ctx: CanvasRenderingContext2D, s: SketchSession) {
   drawRegions(ctx, s);
   drawPartPicks(ctx, s, selected);
   drawOrigin(ctx, s, selected);
-  for (const e of s.data.entities) strokeEntity(ctx, s, e, free, selected);
+  const shown = s.shown();
+  for (const e of shown) strokeEntity(ctx, s, e, free, selected);
+  drawTexts(ctx, s, selected);
   // Selecting a point shows its coincident constraints, so they can be picked and removed.
   for (const c of s.data.constraints) {
-    if (c.type !== 'coincident') continue;
+    if (c.type !== 'coincident' || s.conHidden(c)) continue;
     const showing = [c.a, c.b].some((r) => r && selected.has(r)) || selected.has(`c${c.id}`);
     if (!showing) continue;
     const at = s.pointAt(c.a!) ?? s.pointAt(c.b!);
@@ -502,7 +610,7 @@ export function drawSketch(ctx: CanvasRenderingContext2D, s: SketchSession) {
     glyphPath(ctx, 'coincident', x + 15.5, y - 13.5);
     s.labels.push({ key: `c${c.id}`, x: x + 8, y: y - 21, w: 15, h: 15 });
   }
-  for (const e of s.data.entities) {
+  for (const e of shown) {
     for (const { ref, p } of pointsOf(e)) {
       if (/\.p\d+$/.test(ref) && !selected.has(String(e.id)) && !selected.has(ref) && s.hover !== String(e.id) && s.hover !== ref) continue;
       const [x, y] = s.screen(p);
@@ -513,8 +621,10 @@ export function drawSketch(ctx: CanvasRenderingContext2D, s: SketchSession) {
   }
   drawGlyphs(ctx, s, selected);
   // Last, so a value is never hidden behind an icon.
-  for (const c of s.data.constraints) if (c.value !== undefined) drawDimension(ctx, s, c);
+  for (const c of s.data.constraints) if (c.value !== undefined && !s.conHidden(c)) drawDimension(ctx, s, c);
   drawDraft(ctx, s);
   drawTrim(ctx, s);
+  drawExtend(ctx, s);
+  drawPattern(ctx, s);
   drawSnap(ctx, s);
 }

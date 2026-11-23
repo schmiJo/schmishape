@@ -1,0 +1,23 @@
+/* A Drawing tab: the sheet sits over the 3D view on the grey of a drafting table. */
+.drawing-stage { position: absolute; inset: 0; z-index: 2; overflow: hidden; background: #d9dcdf; cursor: grab; touch-action: none; }
+.drawing-stage.panning { cursor: grabbing; }
+.drawing-sheet { position: absolute; background: #fff; box-shadow: 0 1px 3px rgba(28, 34, 39, .25), 0 0 0 1px rgba(28, 34, 39, .08); user-select: none; transition: opacity .15s; }
+.drawing-sheet.stale { opacity: .6; }
+.drawing-problem { position: absolute; left: 50%; top: 40%; transform: translateX(-50%); max-width: 46ch; padding: 10px 14px; background: #fff; border: 1px solid var(--alloy-3); border-left: 3px solid var(--oxide); border-radius: 3px; cursor: default; }
+.drawing-notes { position: absolute; left: 10px; bottom: 10px; max-width: 60ch; padding: 6px 10px; background: #fff; border: 1px solid #e0c48a; border-radius: 3px; cursor: default; }
+.drawing-notes p { display: flex; align-items: center; gap: 6px; }
+.drawing-wait { position: absolute; left: 50%; top: 45%; transform: translateX(-50%); color: var(--text-2); }
+.drawing-zoom { position: absolute; right: 10px; bottom: 10px; display: flex; background: #fff; border: 1px solid var(--alloy-3); border-radius: 3px; }
+.drawing-fields { display: flex; flex-direction: column; gap: 4px; padding: 0 10px 8px; }
+.drawing-field { display: grid; grid-template-columns: 74px minmax(0, 1fr); align-items: center; gap: 6px; min-height: 24px; }
+.drawing-field > span:first-child { color: var(--text-2); }
+.drawing-field .select, .drawing-input { width: 100%; height: 22px; padding: 0 2px; background: #fff; border: 0; border-bottom: 1px solid var(--alloy-3); outline: none; }
+.drawing-field .select:hover, .drawing-input:hover { border-bottom-color: #9ea5ab; }
+.drawing-field .select:focus, .drawing-input:focus { border-bottom-color: var(--accent); box-shadow: 0 1px 0 var(--accent); }
+.drawing-row .row-more.held { opacity: 1; }
+.drawing-row:hover .row-more { opacity: 1; }
+.drawing-stage .dialog { cursor: default; }
+/* The sidebar's grid is made for the Part Studio's three panels; a drawing's stack from the top and scroll. */
+.sidebar:has(.drawing-panel) { display: flex; flex-direction: column; overflow-y: auto; }
+.sidebar:has(.drawing-panel) .panel { flex: none; }
+.sidebar:has(.drawing-panel) .parts-list { max-height: none; }

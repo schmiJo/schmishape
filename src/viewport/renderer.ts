@@ -13,11 +13,13 @@ uniform mat4 uVP;
 uniform highp usampler2D uStates;
 uniform highp sampler2D uColors;
 out vec3 vN;
+out vec3 vW;
 flat out uint vState;
 flat out uint vId;
 flat out vec4 vColor;
 void main(){
   vN = aNormal;
+  vW = aPos;
   vId = aFace;
   vState = texelFetch(uStates, ivec2(int(aFace) % ${TEX_W}, int(aFace) / ${TEX_W}), 0).r;
   vColor = texelFetch(uColors, ivec2(int(aFace) % ${TEX_W}, int(aFace) / ${TEX_W}), 0);
@@ -28,16 +30,30 @@ void main(){
 const SOLID_FS = `#version 300 es
 precision highp float;
 in vec3 vN;
+in vec3 vW;
 flat in uint vState;
 flat in uint vId;
 flat in vec4 vColor;
 uniform vec3 uRight, uUp, uBack;
 uniform float uOverlay;
 uniform float uAlpha;
+uniform float uPaper;
+uniform vec4 uClip;
+uniform float uClipOn;
 out vec4 o;
 const vec3 ALLOY = vec3(0.77, 0.80, 0.82);
 const vec3 MARK = vec3(0.91, 0.55, 0.03);
+// Whether a triangle faces the camera. Not every face's triangles wind the same way, so it goes by the normal, against
+// the triangle's own plane turned toward the camera, which keeps curved faces right up to their outline.
+bool facing(vec3 w, vec3 n, vec3 back){
+  vec3 g = cross(dFdx(w), dFdy(w));
+  if (dot(g, back) < 0.0) g = -g;
+  return dot(n, g) >= 0.0;
+}
 void main(){
+  // A section view cuts away what's in front of its plane. What's seen of the inside through the cut is the cap's,
+  // drawn in a pass of its own.
+  if (uClipOn > 0.5 && (dot(vW, uClip.xyz) > uClip.w || !facing(vW, vN, uBack))) discard;
   if (uOverlay > 0.5) {
     if (vState == 0u) discard;
     o = vec4(MARK, 0.5);
@@ -56,9 +72,45 @@ void main(){
   // A part given a color of its own has it in its faces' texel, and the rest stay alloy grey.
   vec3 base = vColor.a > 0.5 ? vColor.rgb : ALLOY;
   vec3 c = base * lum + vec3(gloss * 0.16 + rim * 0.10);
+  // Hidden edges removed: a line drawing, the faces left as plain paper.
+  if (uPaper > 0.5) c = vec3(0.985, 0.988, 0.99);
   if (vState == 1u) c = mix(c, MARK, 0.16);
   else if (vState >= 2u) c = mix(c, MARK, 0.4);
   o = vec4(c, uAlpha);
+}`;
+
+/**
+ * A section view's cap: the inside of a part, seen from behind through the cut, drawn flat and at the cut's depth, so
+ * the cut looks filled in and nothing inside shows through it.
+ */
+const CAP_FS = `#version 300 es
+precision highp float;
+in vec3 vN;
+in vec3 vW;
+flat in uint vState;
+flat in uint vId;
+flat in vec4 vColor;
+uniform vec3 uBack;
+uniform vec4 uClip;
+uniform mat4 uVP;
+out vec4 o;
+const vec3 MARK = vec3(0.91, 0.55, 0.03);
+// Whether a triangle faces the camera. Not every face's triangles wind the same way, so it goes by the normal, against
+// the triangle's own plane turned toward the camera, which keeps curved faces right up to their outline.
+bool facing(vec3 w, vec3 n, vec3 back){
+  vec3 g = cross(dFdx(w), dFdy(w));
+  if (dot(g, back) < 0.0) g = -g;
+  return dot(n, g) >= 0.0;
+}
+void main(){
+  if (facing(vW, vN, uBack) || dot(vW, uClip.xyz) > uClip.w) discard;
+  float along = dot(uBack, uClip.xyz);
+  vec3 p = abs(along) > 1e-6 ? vW + uBack * ((uClip.w - dot(vW, uClip.xyz)) / along) : vW;
+  vec4 c = uVP * vec4(p, 1.0);
+  gl_FragDepth = clamp((c.z / c.w) * 0.5 + 0.5, 0.0, 1.0);
+  vec3 cap = vColor.a > 0.5 ? vColor.rgb * 0.8 : vec3(0.62, 0.66, 0.69);
+  if (vState >= 2u) cap = mix(cap, MARK, 0.3);
+  o = vec4(cap, 1.0);
 }`;
 
 const LINE_VS = `#version 300 es
@@ -74,9 +126,11 @@ uniform highp usampler2D uStates;
 flat out uint vState;
 flat out uint vId;
 out float vDist;
+out vec3 vW;
 flat out float vHalf;
 void main(){
   vId = aId;
+  vW = mix(aA, aB, aCorner.x);
   vState = texelFetch(uStates, ivec2(int(aId) % ${TEX_W}, int(aId) / ${TEX_W}), 0).r;
   float width = vState == 0u ? uWidths.x : (vState == 1u ? uWidths.y : uWidths.z);
   float hw = width * 0.5 + 1.0;
@@ -99,10 +153,14 @@ const LINE_FS = `#version 300 es
 precision highp float;
 flat in uint vState;
 in float vDist;
+in vec3 vW;
 flat in float vHalf;
 uniform vec4 uColor0, uColor1, uColor2;
+uniform vec4 uClip;
+uniform float uClipOn;
 out vec4 o;
 void main(){
+  if (uClipOn > 0.5 && dot(vW, uClip.xyz) > uClip.w) discard;
   vec4 c = vState == 0u ? uColor0 : (vState == 1u ? uColor1 : uColor2);
   // One pixel of fade centred on the edge of the line, so it comes out as wide as it says.
   float a = clamp(vHalf + 0.5 - abs(vDist), 0.0, 1.0);
@@ -112,9 +170,13 @@ void main(){
 const PICK_FS = `#version 300 es
 precision highp float;
 flat in uint vId;
+in vec3 vW;
 uniform float uKind;
+uniform vec4 uClip;
+uniform float uClipOn;
 out vec4 o;
 void main(){
+  if (uClipOn > 0.5 && dot(vW, uClip.xyz) > uClip.w) discard;
   o = vec4(float(vId & 255u) / 255.0, float((vId >> 8u) & 255u) / 255.0, float((vId >> 16u) & 255u) / 255.0, uKind / 255.0);
 }`;
 
@@ -135,8 +197,10 @@ uniform mat4 uVP;
 uniform highp usampler2D uStates;
 flat out uint vState;
 flat out uint vId;
+out vec3 vW;
 void main(){
   vId = aRegion;
+  vW = aPos;
   vState = texelFetch(uStates, ivec2(int(aRegion) % ${TEX_W}, int(aRegion) / ${TEX_W}), 0).r;
   gl_Position = uVP * vec4(aPos, 1.0);
 }`;
@@ -241,13 +305,14 @@ class StateTex {
   }
 }
 
-export interface PlaneQuad { id: number; origin: V3; u: V3; v: V3; half: number; lit: boolean }
+/** A plane drawn as a square. `pickable: false` shows it without letting a click land on it, as the plane being made. */
+export interface PlaneQuad { id: number; origin: V3; u: V3; v: V3; half: number; lit: boolean; pickable?: boolean }
 export interface PickHit { kind: 'face' | 'edge' | 'plane' | 'region'; id: number }
 
 export class Renderer {
   gl: WebGL2RenderingContext;
   camera = new Camera();
-  private solid; private line; private pickSolid; private pickLine; private fill; private region; private pickRegion;
+  private solid; private cap; private line; private pickSolid; private pickLine; private fill; private region; private pickRegion;
   private regions: GpuRegions | null = null;
   private quad: WebGLBuffer;
   private fillVao: WebGLVertexArrayObject;
@@ -273,6 +338,11 @@ export class Renderer {
   regionsOnTop = false;
   /** While picking regions, the preview is glass over the model before it, so the sketch stays in sight underneath. */
   ghostPreview = false;
+  /** How parts are drawn: see DisplayMode. */
+  displayMode: 'shaded' | 'no-edges' | 'hidden-edges' | 'hidden-removed' | 'translucent' | 'wireframe' = 'shaded';
+  /** A section view: what's on the far side of this plane, along its normal, is cut away. */
+  section: { normal: V3; offset: number } | null = null;
+  private meshLines = new WeakSet<GpuLines>();
   /** How solid the preview's glass is, from 0 to 1. */
   previewOpacity = 0.35;
   private raf = 0;
@@ -282,6 +352,7 @@ export class Renderer {
     if (!gl) throw new Error('This browser has no WebGL2.');
     this.gl = gl;
     this.solid = program(gl, SOLID_VS, SOLID_FS);
+    this.cap = program(gl, SOLID_VS, CAP_FS);
     this.line = program(gl, LINE_VS, LINE_FS);
     this.pickSolid = program(gl, SOLID_VS, PICK_FS);
     this.pickLine = program(gl, LINE_VS, PICK_FS);
@@ -361,7 +432,9 @@ export class Renderer {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idx);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.indices, gl.STATIC_DRAW);
     gl.bindVertexArray(null);
-    return { vao, buffers: [pos, nor, face, idx], indexCount: m.indices.length, lines: this.makeLines(m.segments, m.segmentIds), faceStates: new StateTex(gl), faceColors: new ColorTex(gl) };
+    const lines = this.makeLines(m.segments, m.segmentIds);
+    this.meshLines.add(lines);
+    return { vao, buffers: [pos, nor, face, idx], indexCount: m.indices.length, lines, faceStates: new StateTex(gl), faceColors: new ColorTex(gl) };
   }
 
   private freeMesh(m: GpuMesh | null) {
@@ -499,11 +572,19 @@ export class Renderer {
     this.planes = planes;
     this.freeLines(this.planeLines);
     const seg: number[] = [];
-    for (const p of planes) {
+    const ids: number[] = [];
+    const lit = new Map<number, number>();
+    planes.forEach((p, n) => {
       const c = this.corners(p);
-      for (let i = 0; i < 4; i++) seg.push(...c[i], ...c[(i + 1) % 4]);
-    }
-    this.planeLines = seg.length ? this.makeLines(new Float32Array(seg), new Uint32Array(seg.length / 6)) : null;
+      for (let i = 0; i < 4; i++) {
+        seg.push(...c[i], ...c[(i + 1) % 4]);
+        ids.push(n);
+      }
+      if (p.lit) lit.set(n, 1);
+    });
+    // A lit plane's outline is lit too.
+    this.planeLines = seg.length ? this.makeLines(new Float32Array(seg), new Uint32Array(ids)) : null;
+    this.planeLines?.states.set(lit);
     this.invalidate();
   }
 
@@ -537,8 +618,17 @@ export class Renderer {
     }
   };
 
+  /** The section plane, for what it cuts: the parts and their edges, not sketches or planes. */
+  private setClip(prog: { u: Record<string, WebGLUniformLocation | null> }, on: boolean) {
+    const gl = this.gl;
+    const s = on ? this.section : null;
+    gl.uniform1f(prog.u.uClipOn, s ? 1 : 0);
+    if (s) gl.uniform4f(prog.u.uClip, s.normal[0], s.normal[1], s.normal[2], s.offset);
+  }
+
   private drawMeshSolid(prog: { u: Record<string, WebGLUniformLocation | null> }, m: GpuMesh, vp: Float32Array) {
     const gl = this.gl;
+    this.setClip(prog, true);
     gl.uniformMatrix4fv(prog.u.uVP, false, vp);
     m.faceStates.bind(0);
     gl.uniform1i(prog.u.uStates, 0);
@@ -551,6 +641,7 @@ export class Renderer {
   private drawLines(prog: { u: Record<string, WebGLUniformLocation | null> }, l: GpuLines, vp: Float32Array, widths: [number, number, number], colors?: number[][], bias = 3e-4) {
     const gl = this.gl;
     const d = this.dpr;
+    this.setClip(prog, this.meshLines.has(l));
     gl.uniformMatrix4fv(prog.u.uVP, false, vp);
     gl.uniform2f(prog.u.uRes, this.canvas.width, this.canvas.height);
     gl.uniform3f(prog.u.uWidths, widths[0] * d, widths[1] * d, widths[2] * d);
@@ -591,27 +682,56 @@ export class Renderer {
       return;
     }
 
-    if (this.mesh) {
+    const display = this.displayMode;
+    const opaque = display !== 'translucent' && display !== 'wireframe';
+    if (this.mesh && opaque) {
       gl.useProgram(this.solid.p);
       gl.uniform3fv(this.solid.u.uRight, r);
       gl.uniform3fv(this.solid.u.uUp, u);
       gl.uniform3fv(this.solid.u.uBack, b);
       gl.uniform1f(this.solid.u.uOverlay, 0);
       gl.uniform1f(this.solid.u.uAlpha, 1);
+      gl.uniform1f(this.solid.u.uPaper, display === 'hidden-removed' ? 1 : 0);
       gl.enable(gl.POLYGON_OFFSET_FILL);
       gl.polygonOffset(1.5, 1.5);
       this.drawMeshSolid(this.solid, this.mesh, vp);
       gl.disable(gl.POLYGON_OFFSET_FILL);
+      if (this.section) {
+        gl.useProgram(this.cap.p);
+        gl.uniform3fv(this.cap.u.uBack, b);
+        this.drawMeshSolid(this.cap, this.mesh, vp);
+      }
     }
 
     gl.enable(gl.BLEND);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
 
+    if (this.mesh && display === 'translucent') {
+      // Glass: every face shows, the near ones over the far, and the edges show through.
+      gl.useProgram(this.solid.p);
+      gl.uniform3fv(this.solid.u.uRight, r);
+      gl.uniform3fv(this.solid.u.uUp, u);
+      gl.uniform3fv(this.solid.u.uBack, b);
+      gl.uniform1f(this.solid.u.uOverlay, 0);
+      gl.uniform1f(this.solid.u.uAlpha, 0.28);
+      gl.uniform1f(this.solid.u.uPaper, 0);
+      this.drawMeshSolid(this.solid, this.mesh, vp);
+    }
+
     if (this.mesh) {
       gl.useProgram(this.line.p);
       const base = [0.13, 0.16, 0.19, 0.82];
-      this.drawLines(this.line, this.mesh.lines, vp, [this.edgeWidth(), 2.25, 2.25], [base, MARK_RGBA, MARK_RGBA]);
+      const width = this.edgeWidth();
+      // Edges behind faces, faint, for the modes that show them.
+      if (display === 'hidden-edges' || display === 'translucent' || display === 'wireframe') {
+        gl.disable(gl.DEPTH_TEST);
+        const faint = display === 'wireframe' ? base : [0.13, 0.16, 0.19, 0.28];
+        this.drawLines(this.line, this.mesh.lines, vp, [width * (display === 'wireframe' ? 1 : 0.8), 2.25, 2.25], [faint, MARK_RGBA, MARK_RGBA]);
+        gl.enable(gl.DEPTH_TEST);
+      }
+      if (display !== 'no-edges' && display !== 'wireframe') this.drawLines(this.line, this.mesh.lines, vp, [width, 2.25, 2.25], [base, MARK_RGBA, MARK_RGBA]);
+      else if (display === 'no-edges') this.drawLines(this.line, this.mesh.lines, vp, [0, 2.25, 2.25], [[0, 0, 0, 0], MARK_RGBA, MARK_RGBA]);
     }
 
     if (this.pickMesh) {
@@ -680,7 +800,8 @@ export class Renderer {
     if (this.planeLines) {
       gl.useProgram(this.line.p);
       const c = [0.5, 0.63, 0.8, 0.5];
-      this.drawLines(this.line, this.planeLines, vp, [1, 1, 1], [c, c, c]);
+      const lit = [0.91, 0.55, 0.03, 0.8];
+      this.drawLines(this.line, this.planeLines, vp, [1, 1.5, 1.5], [c, lit, lit]);
     }
   }
 
@@ -795,9 +916,10 @@ export class Renderer {
       gl.bindVertexArray(this.fillVao);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.fillBuf);
       for (const p of this.planes) {
+        if (p.pickable === false) continue;
         const c = this.corners(p);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([...c[0], ...c[1], ...c[3], ...c[2]]), gl.DYNAMIC_DRAW);
-        gl.uniform4fv(this.fill.u.uColor, [p.id / 255, 0, 0, 3 / 255]);
+        gl.uniform4fv(this.fill.u.uColor, [(p.id & 255) / 255, ((p.id >> 8) & 255) / 255, ((p.id >> 16) & 255) / 255, 3 / 255]);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       }
       gl.clear(gl.DEPTH_BUFFER_BIT);

@@ -3,3 +3,4 @@ dist
 engine/target
 src/engine/engine.wasm
 *.log
+engine/.kernel

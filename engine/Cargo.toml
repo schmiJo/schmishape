@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 coreshape = { path = "../../core_shape/crates/kernel" }
 coreshape-document = { path = "../../core_shape/crates/document" }
 coreshape-mcp = { path = "../../core_shape/crates/mcp" }
+coreshape-drawing = { path = "../../core_shape/crates/drawing" }
 
 [workspace]
 

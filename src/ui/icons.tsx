@@ -35,6 +35,7 @@ const ICONS: Record<string, Part[]> = {
   rect: [['l', 'M4.5 5.5H15.5V14.5H4.5Z'], ['n', `${NODE(4.5, 5.5)}${NODE(15.5, 5.5)}${NODE(15.5, 14.5)}${NODE(4.5, 14.5)}`]],
   circle: [['l', `${CIRCLE(10, 10, 6.5)}M10 8V12M8 10H12`]],
   arc: [['l', 'M4.5 15.5A11 11 0 0 1 15.5 4.5'], ['d', 'M4.5 15.5H15.5V4.5'], ['n', `${NODE(4.5, 15.5)}${NODE(15.5, 4.5)}`]],
+  text: [['l', 'M4.5 4.5V3H15.5V4.5M10 3V17M7.5 17H12.5']],
   point: [['l', 'M10 3.5V7M10 13V16.5M3.5 10H7M13 10H16.5'], ['n', 'M8.5 8.5h3v3h-3z']],
   dimension: [['l', 'M3.5 5V15M16.5 5V15M3.5 10H16.5'], ['n', 'M3.5 10L7.5 8.2V11.8ZM16.5 10L12.5 8.2V11.8Z']],
   construction: [['d', 'M5 15L15 5'], ['n', 'M3.5 13.5h3v3h-3zM13.5 3.5h3v3h-3z']],
@@ -62,6 +63,7 @@ const ICONS: Record<string, Part[]> = {
   part: [['f', BLOCK], ['l', `${BLOCK}${BLOCK_Y}`]],
   eye: [['l', `M2.5 10C5 6 7.5 5 10 5S15 6 17.5 10C15 14 12.5 15 10 15S5 14 2.5 10Z`], ['n', 'M8.5 8.5h3v3h-3z']],
   'eye-off': [['l', 'M2.5 10C5 6 7.5 5 10 5S15 6 17.5 10C15 14 12.5 15 10 15S5 14 2.5 10ZM4 16L16 4']],
+  note: [['l', `${CIRCLE(10, 10, 7)}M10 9V14M10 6V6.5`]],
   warn: [['l', 'M10 3.5L17.5 16.5H2.5ZM10 8V12.5M10 14V15.5']],
   plus: [['l', 'M10 4.5V15.5M4.5 10H15.5']],
   minus: [['l', 'M4.5 10H15.5']],
@@ -100,11 +102,12 @@ export function Icon(props: { name: string; size?: number }) {
   );
 }
 
-export const iconForFeature = (f: { type?: string; shape?: string; direction?: unknown }) => {
+export const iconForFeature = (f: { type?: string; shape?: string; direction?: unknown; app?: unknown }) => {
   if (f.type === 'solid') return f.shape ?? 'box';
   if (f.type === 'constrained_sketch' || f.type === 'sketch') return 'sketch';
   if (f.type === 'pattern') return f.direction ? 'pattern-linear' : 'pattern-circular';
-  const named: Record<string, string> = { delete_face: 'delete-face', delete_bodies: 'delete-part', copy_faces: 'copy-faces', fillet_radii: 'fillet', trim: 'trim-surface', import_step: 'import', import_step_parts: 'import' };
+  if (f.type === 'extrude' && (f as { app?: { tab?: boolean } }).app?.tab) return 'tab';
+  const named: Record<string, string> = { sheet_metal: 'sheet-metal', delete_face: 'delete-face', delete_bodies: 'delete-part', copy_faces: 'copy-faces', fillet_radii: 'fillet', trim: 'trim-surface', import_step: 'import', import_step_parts: 'import' };
   if (f.type && named[f.type]) return named[f.type];
   const name = f.type ?? 'box';
   return TOOL_ICONS[`./tool-icons/${name}.svg`] || ICONS[name] ? name : 'box';

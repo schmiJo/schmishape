@@ -1,4 +1,5 @@
 import type { V3 } from '../viewport/math';
+import { blobsFor } from './blobs';
 
 export interface ToolResult {
   ok: boolean;
@@ -17,14 +18,27 @@ export interface MeshData {
   edges: number;
   /** Each separate solid, by index into the faces and edges above. */
   /** Each body, by the kernel's name for it, such as f3 or f3.2. A sheet is a surface, with no inside. */
-  parts: { name: string; sheet: boolean; faces: number[]; edges: number[] }[];
+  parts: { name: string; label?: string; sheet: boolean; faces: number[]; edges: number[] }[];
   min: V3;
   max: V3;
   error?: string;
 }
 
+/** A drawing as the engine writes it: SVG or DXF text, or a PDF's or PNG's bytes in base64. */
+export type DrawingResult =
+  | { ok: true; data: string; scale: string; width: number; height: number; notes: string[] }
+  | { ok: false; error: string };
+
 /** The kernel panicked, or was stopped. The instance is gone, and so is its document. */
 export class EngineCrash extends Error {}
+
+/** How far the kernel has got with a long call: a STEP import's `parsing` (bytes), `solids`, `rebuild` (features) and `measuring` (bodies). */
+export interface Progress {
+  feature?: number;
+  stage: string;
+  done: number;
+  total: number;
+}
 
 type Pending = { resolve: (v: any) => void; reject: (e: Error) => void };
 
@@ -36,6 +50,8 @@ export class Engine {
   onBusyChange: ((busy: boolean) => void) | null = null;
   /** The instance is gone with its document. Whoever holds the document has to put it back. */
   onCrash: ((message: string) => void) | null = null;
+  /** Hears the kernel's progress during a call, at most once per whole percent of a stage. */
+  onProgress: ((p: Progress) => void) | null = null;
 
   constructor() {
     this.spawn();
@@ -48,6 +64,14 @@ export class Engine {
         const m = e.data;
         if (m.ready) return resolve();
         if (m.failed) return reject(new Error(m.failed));
+        if (m.progress) {
+          try {
+            this.onProgress?.(JSON.parse(m.progress));
+          } catch {
+            // A progress message is only for show.
+          }
+          return;
+        }
         const p = this.pending.get(m.id);
         if (!p) return;
         this.pending.delete(m.id);
@@ -76,6 +100,12 @@ export class Engine {
 
   /** Calls a tool from the CoreShape tool layer: the same call an AI makes. */
   async call(name: string, args: object = {}): Promise<ToolResult> {
+    // A document the page keeps small names its large texts by hash, and they go back in with it.
+    const a = args as { text?: unknown; blobs?: unknown };
+    if (name === 'document_open' && typeof a.text === 'string' && !a.blobs) {
+      const blobs = await blobsFor(a.text);
+      if (blobs) args = { ...args, blobs };
+    }
     const raw = await this.send<string>('call', { message: JSON.stringify({ name, arguments: args }) });
     const parsed = JSON.parse(raw);
     return {
@@ -107,6 +137,11 @@ export class Engine {
 
   async tools(): Promise<unknown[]> {
     return JSON.parse(await this.send<string>('tools')).result.tools;
+  }
+
+  /** An engineering drawing, laid out by the kernel. See `sx_drawing` in the engine for the arguments. */
+  async drawing(args: object): Promise<DrawingResult> {
+    return JSON.parse(await this.send<string>('drawing', { message: JSON.stringify(args) }));
   }
 
   stl(): Promise<Uint8Array> {

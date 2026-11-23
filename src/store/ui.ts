@@ -23,6 +23,8 @@ export const [paletteOpen, setPaletteOpen] = createSignal(false);
 export interface Selection { faces: number[]; edges: number[] }
 export const [selection, setSelection] = createSignal<Selection>({ faces: [], edges: [] });
 export const [selectedFeature, setSelectedFeature] = createSignal<number | null>(null);
+/** The feature under the pointer in the list, whose faces light up in the view. */
+export const [hoveredFeature, setHoveredFeature] = createSignal<number | null>(null);
 /** Regions picked in the view. An extrude takes them from one sketch, so a selection stays within one too. */
 export const [selectedRegions, setSelectedRegions] = createSignal<{ sketch: number; ids: string[] } | null>(null);
 export const [hoverPlane, setHoverPlane] = createSignal<number | null>(null);
@@ -60,12 +62,11 @@ export function toggleGeometry(id: 'origin' | number) {
   else next.add(id);
   saveHidden(next);
 }
-/** Hides all the planes, or shows them all if any were hidden. */
-export function togglePlanes() {
+/** Hides Top, Front and Right, or shows them. */
+export function setDefaultPlanesHidden(hidden: boolean) {
   const next = new Set(geometryHidden());
-  const anyShown = [1, 2, 3].some((p) => !next.has(p));
   for (const p of [1, 2, 3]) {
-    if (anyShown) next.add(p);
+    if (hidden) next.add(p);
     else next.delete(p);
   }
   saveHidden(next);
@@ -100,3 +101,24 @@ export const [appearanceFor, setAppearanceFor] = createSignal<string | null>(nul
 export const [lookPreview, setLookPreview] = createSignal<{ body: string; color: string | null } | null>(null);
 /** The part being renamed in the Parts list, by the kernel's name for it. */
 export const [renamingPart, setRenamingPart] = createSignal<string | null>(null);
+
+/**
+ * How parts are drawn, as Onshape's view menu offers: shaded with edges, without them, with hidden edges showing, as a
+ * line drawing with hidden edges removed, translucent, or edges only. It's how you like to look, so it isn't saved with
+ * the model.
+ */
+export type DisplayMode = 'shaded' | 'no-edges' | 'hidden-edges' | 'hidden-removed' | 'translucent' | 'wireframe';
+const DISPLAY_KEY = 'schmishape.display';
+function loadDisplay(): DisplayMode {
+  try {
+    const v = localStorage.getItem(DISPLAY_KEY);
+    return v && ['shaded', 'no-edges', 'hidden-edges', 'hidden-removed', 'translucent', 'wireframe'].includes(v) ? (v as DisplayMode) : 'shaded';
+  } catch {
+    return 'shaded';
+  }
+}
+export const [displayMode, setDisplayModeSignal] = createSignal<DisplayMode>(loadDisplay());
+export function setDisplayMode(m: DisplayMode) {
+  setDisplayModeSignal(m);
+  try { localStorage.setItem(DISPLAY_KEY, m); } catch { /* It only costs remembering this for next time. */ }
+}

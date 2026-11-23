@@ -31,3 +31,9 @@
 .mate-dof { color: var(--text-2); font-size: 11px; }
 .asm-empty-link { pointer-events: auto; color: var(--text-2); margin: 0; }
 .asm-empty-link:hover { color: var(--text); }
+.asm-slider { padding: 0 10px 4px 32px; }
+.asm-slider input, .explode-step input[type=range] { width: 100%; accent-color: var(--accent); }
+.explode-step { display: flex; flex-direction: column; gap: 2px; padding: 4px 6px 6px; border: 1px solid var(--alloy-3); border-radius: var(--radius); }
+.explode-step .pick-head { display: flex; justify-content: space-between; gap: 6px; }
+.explode-step .pick-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.explode-shift .field { grid-template-columns: 20px minmax(0, 1fr); }

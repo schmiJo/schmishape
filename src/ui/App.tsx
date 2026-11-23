@@ -2,9 +2,19 @@ import { For, onCleanup, onMount, Show } from 'solid-js';
 import { handleKey, command } from '../commands';
 import { AssemblyDialogs, AssemblyEmpty } from '../assembly/ui';
 import { booted, doc, setAsideAutosave } from '../store/doc';
-import { bootTabs, inAssembly, tabManagerOpen } from '../store/tabs';
+import { bootTabs, inAssembly, inDrawing, notStudio, tabManagerOpen } from '../store/tabs';
+import { DrawingPanels, DrawingSheet } from '../drawing/ui';
+import { flatOpen } from '../store/sheetmetal';
 import { dismissToast, glProblem, mode, toast, toasts } from '../store/ui';
 import { FeatureDialog } from './FeatureDialog';
+import { FlatPanel } from './FlatPanel';
+import { MeasureBox } from './Measure';
+import { SectionBar } from './SectionBar';
+import { PatternBar } from './PatternBar';
+import { ImportCard } from './ImportCard';
+import { MassPanel, massOpen } from './MassPanel';
+import { VersionsPanel } from './VersionsPanel';
+import { versionsOpen } from '../store/versions';
 import { AppearanceDialog } from './Appearance';
 import { Palette } from './Palette';
 import { AssemblyPanels, Features, Parts, Variables } from './Sidebar';
@@ -29,6 +39,7 @@ export function Crashed(props: { error: unknown }) {
 }
 
 export function App() {
+  const showFlat = () => flatOpen() && !notStudio();
   onMount(() => {
     window.addEventListener('keydown', handleKey);
     bootTabs().catch((e) => toast(`The kernel couldn't start. ${(e as Error).message}`, 'error'));
@@ -37,10 +48,10 @@ export function App() {
   return (
     <div class="app">
       <TopBar />
-      <div class="main" classList={{ 'with-tabs': tabManagerOpen() }}>
+      <div class="main" classList={{ 'with-tabs': tabManagerOpen(), 'with-flat': showFlat() }}>
         <Show when={tabManagerOpen()}><TabManager /></Show>
         <aside class="sidebar">
-          <Show when={!inAssembly()} fallback={<AssemblyPanels />}>
+          <Show when={!notStudio()} fallback={inDrawing() ? <DrawingPanels /> : <AssemblyPanels />}>
             <Features />
             <Parts />
             <Variables />
@@ -48,9 +59,16 @@ export function App() {
         </aside>
         <div class="stage">
           <Viewport />
+          <Show when={inDrawing()}><DrawingSheet /></Show>
           <FeatureDialog />
+          <MeasureBox />
+          <SectionBar />
+          <PatternBar />
+          <Show when={massOpen() && !notStudio() && mode() === 'part'}><MassPanel /></Show>
+          <Show when={versionsOpen() && mode() !== 'sketch'}><VersionsPanel /></Show>
           <AppearanceDialog />
-          <Show when={booted() && !inAssembly() && doc.features.length === 0 && mode() === 'part' && !glProblem()}>
+          <ImportCard />
+          <Show when={booted() && !notStudio() && doc.features.length === 0 && mode() === 'part' && !glProblem()}>
             <div class="empty" data-testid="empty">
               <p>Right-click a plane to create a sketch.</p>
               <button class="link" onClick={() => void command('example').run()}>Open the example bracket</button>
@@ -71,6 +89,7 @@ export function App() {
             </For>
           </div>
         </div>
+        <Show when={showFlat()}><FlatPanel /></Show>
       </div>
       <TabBar />
       <StatusBar />

@@ -555,6 +555,18 @@ await page.waitForFunction(() => window.schmishape.doc.solid !== null, { timeout
 const afterStop = await docState();
 const stillThere = await page.evaluate(async () => JSON.parse((await window.schmishape.engine.call('document_show')).text).features.length);
 check('a stopped kernel gets the same document back', stillThere === beforeStop.features.length && near(afterStop.solid.volume, beforeStop.solid.volume), `${stillThere} features, ${afterStop.solid.volume}`);
+// Stopped while it's building one feature, such as a large import, that feature is suppressed rather than built again.
+const slowOne = beforeStop.features[beforeStop.features.length - 1];
+await page.evaluate((id) => { window.schmishape.engine.onProgress({ feature: id, stage: 'solids', done: 1, total: 2 }); window.schmishape.stopEngine(); }, slowOne.id);
+await settle(600);
+await page.waitForFunction((id) => window.schmishape.doc.features.find((f) => f.id === id)?.suppressed === true, { timeout: 8000 }, slowOne.id).catch(() => {});
+const offNow = await page.evaluate((id) => ({ off: window.schmishape.doc.features.find((f) => f.id === id)?.suppressed === true, n: window.schmishape.doc.features.length, toast: document.body.innerText.includes('is suppressed, so the rest of the model can be worked on') }), slowOne.id);
+check('stopping a feature mid-build suppresses it and says so', offNow.off && offNow.n === beforeStop.features.length && offNow.toast, JSON.stringify(offNow));
+await page.keyboard.down('Control'); await page.keyboard.press('z'); await page.keyboard.up('Control');
+await settle(600);
+const backOn = await page.evaluate((id) => !window.schmishape.doc.features.find((f) => f.id === id)?.suppressed, slowOne.id);
+const afterUndo = await docState();
+check('undo builds it again', backOn && near(afterUndo.solid.volume, beforeStop.solid.volume), `${backOn} ${afterUndo.solid?.volume}`);
 
 console.log('mouse and view cube');
 const cam = () => page.evaluate(() => { const c = window.schmishape.view.renderer.camera; return { back: c.back(), target: [...c.target] }; });
@@ -1322,6 +1334,21 @@ const inkAtTop = await page.evaluate(() => {
   return { n, covered };
 });
 check('a plane label doesn’t lie across the part', inkAtTop.covered === 'face' && inkAtTop.n === 0, JSON.stringify(inkAtTop));
+// Finding a clear corner reads the pick buffer, which stalls on the GPU, so it waits until the view holds still.
+const labelReads = await page.evaluate(async () => {
+  const r = window.schmishape.view.renderer, cam = r.camera;
+  let n = 0;
+  const own = r.overModel;
+  r.overModel = function (...a) { n++; return own.apply(this, a); };
+  const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
+  for (let i = 0; i < 8; i++) { cam.target = [cam.target[0] + 0.5, cam.target[1], cam.target[2]]; r.invalidate(); await frame(); }
+  const moving = n;
+  await new Promise((res) => setTimeout(res, 400));
+  const after = n - moving;
+  delete r.overModel;
+  return { moving, after };
+});
+check('plane labels don’t read the pick buffer while the view moves, only once it settles', labelReads.moving === 0 && labelReads.after > 0, JSON.stringify(labelReads));
 
 console.log('errors show up');
 await page.evaluate(() => { setTimeout(() => { throw new Error('smoke boom'); }, 0); });
@@ -1372,6 +1399,43 @@ await wait(600);
 await page.waitForFunction(() => window.schmishape?.doc?.solid != null && !document.querySelector('[data-testid=gl-missing]'), { timeout: 15000 });
 await settle(400);
 check('the part comes back after the GPU does', (await docState()).features.length === featuresBefore);
+
+console.log('STEP import');
+const importText = async (name, text) => {
+  await page.evaluate((name, text) => { window.showOpenFilePicker = async () => [{ name, getFile: async () => new File([text], name) }]; }, name, text);
+  await page.click('[data-testid=file-menu]');
+  await wait(100);
+  await page.$eval('[data-command=import]', (e) => e.click());
+  await page.waitForFunction(() => ['done', 'failed', 'stopped'].includes(document.querySelector('[data-testid=import-card]')?.dataset.stage), { timeout: 60000 });
+  await settle(300);
+  return page.evaluate(() => {
+    const c = document.querySelector('[data-testid=import-card]');
+    const r = { stage: c.dataset.stage, text: c.innerText.replace(/\n+/g, ' / ') };
+    c.querySelector('[aria-label=Close]')?.click();
+    return r;
+  });
+};
+const exported = await page.evaluate(async () => (await window.schmishape.engine.call('export', { format: 'step' })).text);
+let featureCount = (await docState()).features.length;
+let imported = await importText('round trip.step', exported);
+check('a STEP file comes in as a feature', imported.stage === 'done' && (await docState()).features.length === featureCount + 1, imported.text);
+check('the card says how many parts came in', /\d+ parts? added/.test(imported.text), imported.text);
+// A file over 100 KB is kept apart from the document, by its hash: the page holds a small document, a saved file has it all.
+imported = await importText('padded.step', exported.replace('DATA;', `DATA;\n/* ${'padding '.repeat(20000)}*/\n`));
+const kept = await page.evaluate(async () => {
+  const small = window.schmishape.documentText();
+  const whole = await window.schmishape.wholeText(small);
+  return { small: small.length, ref: /"sha256"/.test(small), whole: whole.includes('padding padding') && !/"sha256"/.test(whole) };
+});
+check('a large imported file stays out of the document the page keeps', imported.stage === 'done' && kept.small < 100000 && kept.ref, JSON.stringify(kept));
+check('and a saved file has it', kept.whole);
+featureCount = (await docState()).features.length;
+imported = await importText('broken.step', 'ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=GARBAGE(;\nENDSEC;\nEND-ISO-10303-21;\n');
+check('a damaged file says so, in words', imported.stage === 'failed' && /couldn.t be read/.test(imported.text) && /byte/.test(imported.text), imported.text);
+check('and leaves nothing in the history', (await docState()).features.length === featureCount);
+imported = await importText('notes.step', 'hello');
+check('a file that isn’t STEP says so', imported.stage === 'failed' && /isn.t a STEP file/.test(imported.text), imported.text);
+await page.screenshot({ path: `${out}/42-import-failed.png` });
 
 console.log('no WebGL at all');
 const bare = await puppeteer.launch({ executablePath: process.env.CHROME ?? '/usr/bin/google-chrome', headless: 'new', args: ['--no-sandbox', '--disable-3d-apis'], defaultViewport: { width: 1440, height: 900 } });

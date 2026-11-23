@@ -234,7 +234,34 @@ export function edgeSpots(part: PartMesh, edge: number): Spot[] {
  * Finds a connector again after its part has changed: the same inference point on the same face or edge, nearest where
  * it was. Null means the face or edge has gone.
  */
+/**
+ * Midway between two parallel flat faces, as the kernel's `between` connector: the first's centroid moved halfway to the
+ * second's plane, Z along the first's normal. For a width mate, across a slot and across a tab.
+ */
+export function betweenFrame(part: PartMesh, a: string, b: string): Frame | null {
+  const ia = part.faces.findIndex((f) => f.key === a), ib = part.faces.findIndex((f) => f.key === b);
+  if (ia < 0 || ib < 0 || ia === ib) return null;
+  const fa = part.faces[ia], fb = part.faces[ib];
+  if (fa.surface !== 'plane' || fb.surface !== 'plane' || Math.abs(dot(fa.normal, fb.normal)) < 1 - 1e-6) return null;
+  const ca = facePoints(part, ia).centroid, cb = facePoints(part, ib).centroid;
+  const gap = dot(sub(cb, ca), fa.normal);
+  return frameAt(add(ca, scale(fa.normal, gap / 2)), fa.normal);
+}
+
+/** The face a connector is on, if it's flat, cylindrical or spherical, as a tangent mate takes it. */
+export function shapeOf(part: PartMesh, c: ConnectorRef): { surface: 'plane' | 'cylinder' | 'sphere'; radius: number } | null {
+  if (c.kind !== 'face') return null;
+  const f = part.faces.find((x) => x.key === c.ref);
+  if (!f || !['plane', 'cylinder', 'sphere'].includes(f.surface)) return null;
+  if (f.surface !== 'plane' && !f.radius) return null;
+  return { surface: f.surface as 'plane' | 'cylinder' | 'sphere', radius: f.radius ?? 0 };
+}
+
 export function findSpot(part: PartMesh, c: ConnectorRef): Frame | null {
+  if (c.kind === 'between') {
+    const [a, b] = c.ref.split('|');
+    return betweenFrame(part, a, b);
+  }
   let spots: Spot[] = [];
   if (c.kind === 'face') {
     const i = part.faces.findIndex((f) => f.key === c.ref);

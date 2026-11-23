@@ -9,7 +9,7 @@ registerHooks({
   },
 });
 
-const { adjustedFrame, apply, dragTo, freedom, IDENTITY, mateFrames, MATE_DOF, snapFirst, snapSecond, solve, symEig } = await import('../src/assembly/solver.ts');
+const { adjustedFrame, apply, dragTo, freedom, IDENTITY, mateFrames, MATE_DOF, snapFirst, snapSecond, solve, symEig, tangentFreedom } = await import('../src/assembly/solver.ts');
 
 let passed = 0;
 const failures = [];
@@ -253,6 +253,83 @@ console.log('a part that stays where it is when the mates are already met');
   const q = axisAngle([0, 0, 1], 37);
   const r = solve([body('A', true), body('B', false, [0, 0, 0], q)], [m]);
   check('a swung part stays swung', sameTurn(r.poses.get('B').q, q), JSON.stringify(r.poses.get('B').q));
+}
+
+console.log('tangent mates, by the faces they are between');
+{
+  const plane = { surface: 'plane', radius: 0 };
+  const cyl = (r) => ({ surface: 'cylinder', radius: r });
+  const ball = (r) => ({ surface: 'sphere', radius: r });
+  const up = frame([0, 0, 0], [0, 0, 1]);
+  // A floor's top face, and a cylinder of radius 5 standing straight up, its axis through its connector.
+  let r = solve([body('F', true), body('C', false, [3, 4, 20])], [mate('t', 'tangent', 'F', 'C', up, frame([0, 0, 0], [0, 0, 1]), { sa: plane, sb: cyl(5) })]);
+  let pc = r.poses.get('C');
+  const axis = rotate(pc.q, [0, 0, 1]);
+  check('a cylinder standing up lies down level on a plane', r.failed.length === 0 && Math.abs(axis[2]) < 1e-6, JSON.stringify(axis));
+  check('with its axis its radius above it', near(apply(pc, [0, 0, 0])[2], 5, 1e-6), JSON.stringify(apply(pc, [0, 0, 0])));
+  check('it can still roll, slide and turn: 4 freedoms', r.dof === 4 && tangentFreedom(plane, cyl(5)) === 4, `${r.dof}`);
+  r = solve([body('F', true), body('C', false, [3, 4, 20])], [mate('t', 'tangent', 'F', 'C', up, frame([0, 0, 0], [1, 0, 0]), { sa: plane, sb: cyl(5), flip: true })]);
+  check('flipped, it goes under the plane', near(apply(r.poses.get('C'), [0, 0, 0])[2], -5, 1e-6), JSON.stringify(apply(r.poses.get('C'), [0, 0, 0])));
+  // The same written the other way round: the cylinder first.
+  r = solve([body('C', false, [3, 4, 20]), body('F', true)], [mate('t', 'tangent', 'C', 'F', frame([0, 0, 0], [1, 0, 0]), up, { sa: cyl(5), sb: plane })]);
+  check('either connector can be the cylinder', r.failed.length === 0 && near(apply(r.poses.get('C'), [0, 0, 0])[2], 5, 1e-6));
+  // Two cylinders: radii 5 and 3, axes along x and tilted, 20 apart.
+  r = solve([body('A', true), body('B', false, [0, 20, 1], axisAngle([0, 0, 1], 30))], [mate('t', 'tangent', 'A', 'B', frame([0, 0, 0], [1, 0, 0]), frame([0, 0, 0], [1, 0, 0]), { sa: cyl(5), sb: cyl(3) })]);
+  const pb = r.poses.get('B');
+  const ab = rotate(pb.q, [1, 0, 0]);
+  const o = apply(pb, [0, 0, 0]);
+  check('two cylinders keep their axes parallel', r.failed.length === 0 && near(Math.abs(ab[0]), 1, 1e-6), JSON.stringify(ab));
+  check('and their radii apart', near(Math.hypot(o[1], o[2]), 8, 1e-6), `${Math.hypot(o[1], o[2])}`);
+  r = solve([body('A', true), body('B', false, [0, 20, 1], axisAngle([0, 0, 1], 30))], [mate('t', 'tangent', 'A', 'B', frame([0, 0, 0], [1, 0, 0]), frame([0, 0, 0], [1, 0, 0]), { sa: cyl(5), sb: cyl(3), flip: true })]);
+  const oi = apply(r.poses.get('B'), [0, 0, 0]);
+  check('flipped, one rolls inside the other', near(Math.hypot(oi[1], oi[2]), 2, 1e-6), `${Math.hypot(oi[1], oi[2])}`);
+  r = solve([body('F', true), body('S', false, [1, 2, 30])], [mate('t', 'tangent', 'F', 'S', up, frame([0, 0, 0]), { sa: plane, sb: ball(4) })]);
+  check('a ball rests on a plane', near(apply(r.poses.get('S'), [0, 0, 0])[2], 4, 1e-6) && r.dof === 5, `${apply(r.poses.get('S'), [0, 0, 0])} ${r.dof}`);
+  r = solve([body('A', true), body('S', false, [10, 10, 10])], [mate('t', 'tangent', 'A', 'S', frame([0, 0, 0]), frame([0, 0, 0]), { sa: ball(4), sb: ball(6) })]);
+  check('two balls touch', near(dist(apply(r.poses.get('S'), [0, 0, 0]), [0, 0, 0]), 10, 1e-6));
+  r = solve([body('F', true), body('P', false, [1, 2, 30], axisAngle([1, 0, 0], 40))], [mate('t', 'tangent', 'F', 'P', up, frame([0, 0, 0], [0, 0, 1]), { sa: plane, sb: plane })]);
+  const pp = r.poses.get('P');
+  check('two flat faces go face to face', near(apply(pp, [0, 0, 0])[2], 0, 1e-6) && near(rotate(pp.q, [0, 0, 1])[2], -1, 1e-6) && r.dof === 3, `${rotate(pp.q, [0, 0, 1])} ${r.dof}`);
+}
+
+console.log('width mates');
+{
+  // A slot's middle plane, x = 10, facing x, and a tab's middle somewhere else.
+  const r = solve([body('S', true), body('T', false, [3, 4, 5])], [mate('w', 'width', 'S', 'T', frame([10, 0, 0], [1, 0, 0]), frame([0, 0, 0], [0, 0, 1]))]);
+  const o = apply(r.poses.get('T'), [0, 0, 0]);
+  check('the tab’s middle goes onto the slot’s', near(o[0], 10, 1e-6) && r.dof === 5, `${o} ${r.dof}`);
+  check('and nothing else moves', near(o[1], 4, 1e-6) && near(o[2], 5, 1e-6), `${o}`);
+}
+
+console.log('patterns and exploded views');
+{
+  const { derivedCopies, explodeShifts, compose, inverse } = await import('../src/assembly/extras.ts');
+  const inst = (id, p, q = [0, 0, 0, 1]) => ({ id, tab: 't1', body: 'f1', number: 1, name: null, pose: { p, q }, fixed: false, hidden: false });
+  const data = { format: 'schmishape-assembly', version: 1, instances: [inst('A', [10, 0, 0]), inst('B', [0, 0, 5])], mates: [], next: 9,
+    patterns: [
+      { id: 'p1', name: 'Row', of: ['A'], type: 'linear', axis: 'y', spacing: 15, degrees: 0, count: 3, suppressed: false },
+      { id: 'p2', name: 'Ring', of: ['A'], type: 'circular', axis: 'z', spacing: 0, degrees: 90, count: 4, suppressed: false },
+      { id: 'p3', name: 'Off', of: ['B'], type: 'linear', axis: 'x', spacing: 5, degrees: 0, count: 5, suppressed: true },
+    ] };
+  const c = derivedCopies(data, () => undefined);
+  const row = c.filter((x) => x.from === 'p1');
+  check('a linear pattern of 3 makes 2 copies, spaced along its direction', row.length === 2 && nearV(row[0].pose.p, [10, 15, 0]) && nearV(row[1].pose.p, [10, 30, 0]), JSON.stringify(row.map((x) => x.pose.p)));
+  const ring = c.filter((x) => x.from === 'p2');
+  check('a circular one turns them about its axis', ring.length === 3 && nearV(ring[0].pose.p, [0, 10, 0]) && nearV(ring[1].pose.p, [-10, 0, 0]) && nearV(ring[2].pose.p, [0, -10, 0]), JSON.stringify(ring.map((x) => x.pose.p)));
+  check('turned as well as moved', nearV(rotate(ring[0].pose.q, [1, 0, 0]), [0, 1, 0]));
+  check('a suppressed one makes none', !c.some((x) => x.from === 'p3'));
+  // An axis along a connector follows its part.
+  const along = { ...data, patterns: [{ id: 'p4', name: 'Along', of: ['A'], type: 'linear', axis: { instance: 'B', connector: { kind: 'face', ref: 'x', how: 'centroid', frame: frame([0, 0, 0], [0, 0, 1]) } }, spacing: 10, degrees: 0, count: 2, suppressed: false }] };
+  along.instances[1].pose = { p: [0, 0, 5], q: axisAngle([0, 1, 0], 90) };
+  const a = derivedCopies(along, () => undefined);
+  check('along a connector, it goes the way the connector’s part points it', a.length === 1 && nearV(a[0].pose.p, [20, 0, 0]), JSON.stringify(a.map((x) => x.pose.p)));
+  const pose = { p: [1, 2, 3], q: axisAngle([Math.SQRT1_2, Math.SQRT1_2, 0], 33) };
+  const back = compose(pose, inverse(pose));
+  check('a pose and its inverse cancel', nearV(back.p, [0, 0, 0]) && sameTurn(back.q, [0, 0, 0, 1]));
+  const ex = { ...data, explodes: [{ id: 'x1', name: 'E', steps: [{ instances: ['A'], shift: [0, 0, 10] }, { instances: ['A', 'B'], shift: [5, 0, 0] }] }] };
+  check('an exploded view half way has done its first step', nearV(explodeShifts(ex, 'x1', 0.5).get('A'), [0, 0, 10]) && !explodeShifts(ex, 'x1', 0.5).has('B'));
+  check('and all the way, both', nearV(explodeShifts(ex, 'x1', 1).get('A'), [5, 0, 10]) && nearV(explodeShifts(ex, 'x1', 1).get('B'), [5, 0, 0]));
+  check('three quarters of the way, half the second', nearV(explodeShifts(ex, 'x1', 0.75).get('B'), [2.5, 0, 0]));
 }
 
 console.log('speed');

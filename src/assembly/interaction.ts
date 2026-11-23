@@ -5,8 +5,8 @@ import type { MenuItem } from '../ui/ContextMenu';
 import { edgeSpots, faceSpots, type Spot } from './connectors';
 import type { InstanceData } from './model';
 import {
-  acceptMate, applyDrag, asm, cancelMate, deleteInstances, deleteMate, dragSnapshot, finishDrag, instanceById, instanceName, isDraggable, mateDraft, mateFailures, ownerOfHit,
-  partOf, pickConnector, selectedInstances, selectedMate, selectInstances, setFixed, setHidden, setInsertOpen, insertOpen, setRenamingInstance,
+  acceptExtra, cancelExtra, acceptMate, applyDrag, asm, cancelMate, deleteInstances, deleteMate, dragSnapshot, finishDrag, instanceById, instanceName, isDraggable, mateDraft, mateFailures, ownerOfHit,
+  partOf, pickConnector, extraDraft, pickExtraConnector, toggleExtraInstance, selectedInstances, selectedMate, selectInstances, setFixed, setHidden, setInsertOpen, insertOpen, setRenamingInstance,
 } from './store';
 import { adjustedFrame, apply, type DragGoal, type Frame } from './solver';
 
@@ -202,7 +202,7 @@ function closest(x: number, y: number) {
 /** What the pointer's over, with no button down. With a mate open it offers connectors. Shift keeps it on the same face or edge. */
 export function asmHover(hit: { kind: string; id: number } | null, x: number, y: number) {
   const owner = ownerOfHit(hit);
-  if (mateDraft()) {
+  if (mateDraft() || extraDraft()?.picking) {
     if (!shiftHeld || !spots) {
       spots = owner ? { instance: owner.instance.id, list: hit!.kind === 'face' ? faceSpots(owner.part, owner.local) : edgeSpots(owner.part, owner.local), label: instanceName(owner.instance) } : null;
     }
@@ -234,6 +234,22 @@ export function asmClick(hit: { kind: string; id: number } | null, x: number, y:
     if (!s) return;
     pickConnector({ instance: spots.instance, connector: { kind: s.kind, ref: s.ref, how: s.how, frame: s.frame } });
     invalidate();
+    return;
+  }
+  const extra = extraDraft();
+  if (extra?.picking) {
+    if (!owner) return;
+    if (!spots || spots.instance !== owner.instance.id) spots = { instance: owner.instance.id, list: hit!.kind === 'face' ? faceSpots(owner.part, owner.local) : edgeSpots(owner.part, owner.local), label: instanceName(owner.instance) };
+    const s = closest(x, y);
+    if (!s) return;
+    pickExtraConnector({ instance: spots.instance, connector: { kind: s.kind, ref: s.ref, how: s.how, frame: s.frame } });
+    spots = null;
+    nearest = null;
+    invalidate();
+    return;
+  }
+  if (extra && extra.kind !== 'explode') {
+    if (owner) toggleExtraInstance(owner.instance.id);
     return;
   }
   if (!owner) {
@@ -282,12 +298,17 @@ export function asmMenu(hit: { kind: string; id: number } | null, fit: MenuItem,
 export function asmKey(key: string) {
   if (key === 'escape') {
     if (mateDraft()) cancelMate();
+    else if (extraDraft()) cancelExtra();
     else if (insertOpen()) setInsertOpen(false);
     else selectInstances([]);
     return true;
   }
   if (key === 'enter' && mateDraft()) {
     acceptMate();
+    return true;
+  }
+  if (key === 'enter' && extraDraft()) {
+    acceptExtra();
     return true;
   }
   if ((key === 'delete' || key === 'backspace') && selectedInstances().length) {
@@ -303,8 +324,17 @@ export function asmKey(key: string) {
 }
 
 export function asmHint() {
+  const extra = extraDraft();
+  if (extra?.picking) return extra.kind === 'pattern' ? 'Click a face or edge for the axis: the pattern runs along its connector’s Z.' : 'Click the face the copies go at, on the part they go on, such as the hole a screw is in.';
+  if (extra?.kind === 'explode') return 'Select parts in the view, then add a step that moves them. The slider shows it part of the way.';
+  if (extra) return 'Click parts to add them to the copies or take them out.';
   const draft = mateDraft();
   if (draft) {
+    if (draft.type === 'width' && draft.half) return 'Click the face across from it: the other side of the slot or tab. Click the same face again to use just that one.';
+    if (draft.type === 'width' && !draft.first) return 'Click two parallel faces of the part that moves, one each side of it, to put its connector midway between them.';
+    if (draft.type === 'width' && !draft.second) return 'Click two parallel faces of the other part, such as a slot’s sides.';
+    if (draft.type === 'tangent' && !draft.first) return 'Click a flat, cylindrical or spherical face of the part that moves. Right drag rotates.';
+    if (draft.type === 'tangent' && !draft.second) return 'Click the face it touches: flat, cylindrical or spherical.';
     if (!draft.first) return 'Hover a face or edge and click a connector for the part that moves. Right drag rotates.';
     if (!draft.second) return 'Click a connector on the part it goes to. Hold Shift to stay on one face or edge.';
     return 'Flip or turn it if it’s the wrong way round, then press Enter. Right drag rotates.';
@@ -339,7 +369,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, o: V3, f: Frame, pose: Instanc
 
 function drawConnectors(ctx: CanvasRenderingContext2D) {
   const draft = mateDraft();
-  if (!draft) return;
+  if (!draft && !extraDraft()?.picking) return;
   if (spots) {
     const i = instanceById(spots.instance);
     if (i) {
@@ -357,6 +387,7 @@ function drawConnectors(ctx: CanvasRenderingContext2D) {
       if (nearest) drawFrame(ctx, apply(i.pose, nearest.frame.o), nearest.frame, i.pose, true);
     }
   }
+  if (!draft) return;
   for (const picked of [draft.first, draft.second]) {
     if (!picked) continue;
     const i = instanceById(picked.instance);

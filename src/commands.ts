@@ -1,14 +1,20 @@
 import { acceptDialog, activeDef, cancelDialog, startFeature } from './features/dialog';
-import { exportStep, exportStl, importStep, loadExample, openFile, saveDocument } from './files';
+import { exportFlatDxf, exportStep, exportStl, importStep, loadExample, openFile, openWholeDocument, saveDocument, saveWholeDocument } from './files';
+import { loadVersions, setVersionsOpen, versionsOpen } from './store/versions';
 import { finishSketch, looksAtSketch, normalTo, session, startSketch } from './sketch/controller';
-import { PLANES, planeFromPlacement, planeOnFace, type Plane } from './sketch/geometry';
+import { PLANES, planeOnFace, type Plane } from './sketch/geometry';
 import { asmKey } from './assembly/interaction';
 import { MATE_TYPES } from './assembly/model';
-import { asm, asmCanRedo, asmCanUndo, asmRedo, asmUndo, openInsert, startMate } from './assembly/store';
+import { asm, asmCanRedo, asmCanUndo, asmRedo, asmUndo, openInsert, savePosition, startExplode, startMate, startPattern, startReplicate } from './assembly/store';
 import { mateTypeName } from './assembly/solver';
 import { canRedo, canUndo, deleteFeature, doc, faceList, mesh, redo, undo } from './store/doc';
-import { createTab, inAssembly, openBlankStudio, toggleTabManager } from './store/tabs';
-import { clearSelection, glProblem, mode, paletteOpen, selectedFeature, selectedGeometry, selectedRegions, selection, setMode, setPaletteOpen, setShortcutsOpen, setSketchesHidden, shortcutsOpen, sketchesHidden, toast, togglePlanes, toggleSnaps } from './store/ui';
+import { createTab, inAssembly, inDrawing, notStudio, openBlankStudio, tabs, toggleTabManager } from './store/tabs';
+import { drawingCanRedo, drawingCanUndo, drawingRedo, drawingUndo } from './drawing/store';
+import { displayMode, setDisplayMode, type DisplayMode, clearSelection, glProblem, mode, paletteOpen, selectedFeature, selectedGeometry, selectedRegions, selection, setMode, setPaletteOpen, setShortcutsOpen, setSketchesHidden, shortcutsOpen, sketchesHidden, toast, toggleSnaps } from './store/ui';
+import { isPlaneFeature, planeFrame, sketchPlane, togglePlanes } from './store/planes';
+import { flatOpen, isSheetMetalFeature, setFlatOpen, shownSheet } from './store/sheetmetal';
+import { section, SECTION_PLANES, setSection } from './store/section';
+import { massOpen, setMassOpen } from './ui/MassPanel';
 import { view } from './viewport/instance';
 import { cross, normalize, type V3 } from './viewport/math';
 
@@ -19,17 +25,39 @@ export interface Command {
   keys?: string;
   group: string;
   enabled?: () => boolean;
+  /** For a choice of several, whether this one is the one chosen, for a check beside it in a menu. */
+  checked?: () => boolean;
   run: () => void | Promise<void>;
 }
 
 const notSketching = () => mode() !== 'sketch' && !glProblem();
-const inPart = () => notSketching() && !inAssembly();
+const inPart = () => notSketching() && !notStudio();
 const inAsm = () => notSketching() && inAssembly();
 const hasSolid = () => doc.solid !== null;
 const sketchCount = () => doc.features.filter((f) => (f.type === 'constrained_sketch' || f.type === 'sketch') && !(f.name ?? '').startsWith('~')).length;
 const hasSketch = () => sketchCount() > 0;
 const hasSheet = () => !!mesh()?.parts.some((p) => p.sheet);
 const partCount = () => mesh()?.parts.length ?? 0;
+export const hasSheetMetal = () => doc.features.some(isSheetMetalFeature);
+
+/**
+ * Turns the section view on or off. A flat face selected when it's turned on is what cuts, as in Onshape, and otherwise
+ * it's Top, through the middle of the model.
+ */
+async function toggleSection() {
+  if (section()) return setSection(null);
+  const sel = selection();
+  if (sel.faces.length === 1) {
+    const f = (await faceList())[sel.faces[0]];
+    if (f?.surface === 'plane') {
+      setSection({ by: 'face', point: f.center, normal: normalize(f.normal), offset: 0, flip: false, faceName: f.name });
+      return;
+    }
+  }
+  const m = mesh();
+  const mid = m && m.indices.length ? (m.min[2] + m.max[2]) / 2 : 0;
+  setSection({ by: 'top', point: [0, 0, 0], normal: SECTION_PLANES.top, offset: Math.round(mid * 10) / 10, flip: false });
+}
 
 export function fitView() {
   const r = view.renderer;
@@ -59,37 +87,49 @@ export function setViewDirection(back: V3) {
   else r.camera.animateTo({ rot }, 340);
 }
 
-/** The plane a sketch or a normal view would use, from what's selected. */
-async function selectedPlane(): Promise<Plane | null> {
+/**
+ * The plane a sketch or a normal view would use, from what's selected, and what a sketch on it is on when that's more
+ * than its numbers: a plane feature, which the sketch then follows.
+ */
+async function selectedPlane(): Promise<{ plane: Plane; placement?: unknown } | null> {
   const g = selectedGeometry();
-  if (typeof g === 'number') return PLANES[g - 1]?.plane ?? null;
+  if (typeof g === 'number') return PLANES[g - 1] ? { plane: PLANES[g - 1].plane } : null;
+  const chosen = doc.features.find((f) => f.id === selectedFeature());
+  if (chosen && isPlaneFeature(chosen)) {
+    const frame = planeFrame(chosen.id);
+    return frame ? { plane: frame, placement: { on_plane: chosen.id } } : null;
+  }
   const picked = selectedRegions();
-  if (picked) return planeFromPlacement(doc.features.find((f) => f.id === picked.sketch)?.plane, doc.env);
+  if (picked) {
+    const f = doc.features.find((x) => x.id === picked.sketch);
+    return f ? { plane: sketchPlane(f) } : null;
+  }
   const sel = selection();
   if (sel.faces.length === 1) {
     const f = (await faceList())[sel.faces[0]];
-    if (f?.surface === 'plane') return planeOnFace(f.center, f.normal);
+    if (f?.surface === 'plane') return { plane: planeOnFace(f.center, f.normal) };
   }
   return null;
 }
 
 /** Starts a sketch on what's selected, or asks for a plane. */
 export async function beginSketch() {
-  const plane = await selectedPlane();
-  if (plane) return startSketch(plane);
+  const on = await selectedPlane();
+  if (on) return startSketch(on.plane, on.placement ?? null);
   await cancelDialog();
   setMode('pick-plane');
 }
 
 export async function viewNormal() {
   if (session()) return looksAtSketch();
-  const plane = await selectedPlane();
-  if (plane) normalTo(plane);
+  const on = await selectedPlane();
+  if (on) normalTo(on.plane);
   else toast('Select a plane or a flat face first.');
 }
 
 export const COMMANDS: Command[] = [
   { id: 'sketch', title: 'Sketch', icon: 'sketch', keys: 'Shift S', group: 'Model', enabled: inPart, run: beginSketch },
+  { id: 'plane', title: 'Plane', icon: 'plane', group: 'Model', enabled: inPart, run: () => startFeature('plane') },
   { id: 'extrude', title: 'Extrude', icon: 'extrude', keys: 'Shift E', group: 'Model', enabled: () => inPart() && (hasSketch() || hasSolid()), run: () => startFeature('extrude') },
   { id: 'revolve', title: 'Revolve', icon: 'revolve', group: 'Model', enabled: () => inPart() && hasSketch(), run: () => startFeature('revolve') },
   { id: 'fillet', title: 'Fillet', icon: 'fillet', keys: 'G', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('fillet') },
@@ -99,6 +139,9 @@ export const COMMANDS: Command[] = [
   { id: 'helix', title: 'Helix', icon: 'helix', group: 'Model', enabled: () => inPart() && hasSketch(), run: () => startFeature('helix') },
   { id: 'loft', title: 'Loft', icon: 'loft', group: 'Model', enabled: () => inPart() && sketchCount() >= 2, run: () => startFeature('loft') },
   { id: 'draft', title: 'Draft', icon: 'draft', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('draft') },
+  { id: 'rib', title: 'Rib', icon: 'rib', group: 'Model', enabled: () => inPart() && hasSolid() && hasSketch(), run: () => startFeature('rib') },
+  { id: 'hole', title: 'Hole', icon: 'hole', group: 'Model', enabled: () => inPart() && hasSolid() && hasSketch(), run: () => startFeature('hole') },
+  { id: 'split', title: 'Split', icon: 'split', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('split') },
   { id: 'offset', title: 'Offset', icon: 'offset', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('offset') },
   { id: 'thicken', title: 'Thicken', icon: 'thicken', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('thicken') },
   { id: 'delete-face', title: 'Delete face', icon: 'delete-face', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('delete-face') },
@@ -109,19 +152,30 @@ export const COMMANDS: Command[] = [
   { id: 'transform', title: 'Transform', icon: 'transform', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('transform') },
   { id: 'boolean', title: 'Boolean', icon: 'boolean', group: 'Model', enabled: () => inPart() && partCount() >= 2, run: () => startFeature('boolean') },
   { id: 'delete-bodies', title: 'Delete part', icon: 'delete-part', group: 'Model', enabled: () => inPart() && hasSolid(), run: () => startFeature('delete-bodies') },
+  { id: 'sheet-metal', title: 'Sheet metal model', icon: 'sheet-metal', group: 'Sheet metal', enabled: () => inPart() && hasSketch(), run: () => startFeature('sheet-metal') },
+  { id: 'flange', title: 'Flange', icon: 'flange', group: 'Sheet metal', enabled: () => inPart() && hasSheetMetal(), run: () => startFeature('flange') },
+  { id: 'hem', title: 'Hem', icon: 'hem', group: 'Sheet metal', enabled: () => inPart() && hasSheetMetal(), run: () => startFeature('hem') },
+  { id: 'bend', title: 'Bend', icon: 'bend', group: 'Sheet metal', enabled: () => inPart() && hasSheetMetal() && hasSketch(), run: () => startFeature('bend') },
+  { id: 'tab', title: 'Tab', icon: 'tab', group: 'Sheet metal', enabled: () => inPart() && hasSheetMetal() && hasSketch(), run: () => startFeature('tab') },
+  { id: 'flat-pattern', title: 'Flat pattern', icon: 'flat-pattern', group: 'Sheet metal', enabled: () => !notStudio() && hasSheetMetal(), run: () => { setFlatOpen(!flatOpen()); } },
   { id: 'fill', title: 'Fill', icon: 'fill', group: 'Surface', enabled: () => inPart() && hasSketch(), run: () => startFeature('fill') },
   { id: 'sew', title: 'Sew', icon: 'sew', group: 'Surface', enabled: () => inPart() && hasSheet(), run: () => startFeature('sew') },
   { id: 'trim-surface', title: 'Trim surface', icon: 'trim-surface', group: 'Surface', enabled: () => inPart() && hasSheet(), run: () => startFeature('trim') },
-  { id: 'undo', title: 'Undo', icon: 'undo', keys: 'Ctrl Z', group: 'Edit', enabled: () => (inAssembly() ? asmCanUndo() : session() ? session()!.canUndo[0]() : canUndo()), run: () => (inAssembly() ? asmUndo() : session() ? session()!.undo() : undo()) },
-  { id: 'redo', title: 'Redo', icon: 'redo', keys: 'Ctrl Shift Z', group: 'Edit', enabled: () => (inAssembly() ? asmCanRedo() : session() ? session()!.canRedo[0]() : canRedo()), run: () => (inAssembly() ? asmRedo() : session() ? session()!.redo() : redo()) },
+  { id: 'undo', title: 'Undo', icon: 'undo', keys: 'Ctrl Z', group: 'Edit', enabled: () => (inDrawing() ? drawingCanUndo() : inAssembly() ? asmCanUndo() : session() ? session()!.canUndo[0]() : canUndo()), run: () => (inDrawing() ? drawingUndo() : inAssembly() ? asmUndo() : session() ? session()!.undo() : undo()) },
+  { id: 'redo', title: 'Redo', icon: 'redo', keys: 'Ctrl Shift Z', group: 'Edit', enabled: () => (inDrawing() ? drawingCanRedo() : inAssembly() ? asmCanRedo() : session() ? session()!.canRedo[0]() : canRedo()), run: () => (inDrawing() ? drawingRedo() : inAssembly() ? asmRedo() : session() ? session()!.redo() : redo()) },
   { id: 'new', title: 'Create Part Studio', icon: 'part-studio', group: 'File', enabled: notSketching, run: () => createTab('part-studio') },
   { id: 'tab.assembly', title: 'Create Assembly', icon: 'assembly', group: 'File', enabled: notSketching, run: () => createTab('assembly') },
+  { id: 'tab.drawing', title: 'Create Drawing', icon: 'drawing', group: 'File', enabled: () => notSketching() && tabs().some((t) => t.kind === 'part-studio'), run: () => createTab('drawing') },
   { id: 'tab.folder', title: 'Create folder', icon: 'folder', group: 'File', enabled: notSketching, run: () => createTab('folder') },
   { id: 'open', title: 'Open file as a Part Studio', icon: 'import', keys: 'Ctrl O', group: 'File', enabled: notSketching, run: openFile },
   { id: 'save', title: 'Save this Part Studio to a file', icon: 'download', keys: 'Ctrl S', group: 'File', enabled: inPart, run: saveDocument },
+  { id: 'save.document', title: 'Save the whole document to a file', icon: 'download', keys: 'Ctrl Shift S', group: 'File', enabled: notSketching, run: () => saveWholeDocument() },
+  { id: 'open.document', title: 'Open a document file', icon: 'import', group: 'File', enabled: notSketching, run: openWholeDocument },
+  { id: 'versions', title: 'Versions', icon: 'versions', group: 'File', enabled: notSketching, run: () => { if (!versionsOpen()) void loadVersions(); setVersionsOpen(!versionsOpen()); } },
   { id: 'import', title: 'Import STEP', icon: 'import', group: 'File', enabled: inPart, run: importStep },
   { id: 'export.step', title: 'Export STEP', icon: 'download', group: 'File', enabled: () => inPart() && hasSolid(), run: exportStep },
   { id: 'export.stl', title: 'Export STL', icon: 'download', group: 'File', enabled: () => inPart() && hasSolid(), run: exportStl },
+  { id: 'export.dxf', title: 'Export flat pattern as DXF', icon: 'download', group: 'File', enabled: () => inPart() && !!shownSheet()?.flat, run: exportFlatDxf },
   { id: 'example', title: 'Open the example bracket', icon: 'iso', group: 'File', enabled: notSketching, run: async () => { await openBlankStudio('Angle bracket'); await loadExample(); setView('iso'); } },
   { id: 'fit', title: 'Fit to window', icon: 'fit', keys: 'F', group: 'View', run: fitView },
   { id: 'view.iso', title: 'Isometric view', icon: 'iso', keys: '0', group: 'View', run: () => setView('iso') },
@@ -132,10 +186,20 @@ export const COMMANDS: Command[] = [
   { id: 'view.left', title: 'Left view', icon: 'plane', group: 'View', run: () => setView('left') },
   { id: 'view.bottom', title: 'Bottom view', icon: 'plane', group: 'View', run: () => setView('bottom') },
   { id: 'view.normal', title: 'Normal to sketch, plane or face', icon: 'plane', keys: 'N', group: 'View', run: viewNormal },
+  ...([['shaded', 'Shaded'], ['no-edges', 'Shaded without edges'], ['hidden-edges', 'Shaded with hidden edges'], ['hidden-removed', 'Hidden edges removed'], ['translucent', 'Translucent'], ['wireframe', 'Hidden edges visible']] as [DisplayMode, string][]).map(
+    ([m, title]): Command => ({ id: `display.${m}`, title, icon: 'iso', group: 'View', checked: () => displayMode() === m, run: () => setDisplayMode(m) }),
+  ),
+  { id: 'mass', title: 'Mass properties', icon: 'mass', group: 'Inspect', enabled: () => inPart() && !!mesh()?.parts.some((p) => !p.sheet), checked: massOpen, run: () => { setMassOpen(!massOpen()); } },
+  { id: 'view.section', title: 'Section view', icon: 'section', group: 'View', enabled: () => !notStudio() && !!mesh()?.indices.length, run: toggleSection },
   { id: 'view.planes', title: 'Show or hide planes', icon: 'plane', keys: 'P', group: 'View', run: togglePlanes },
   { id: 'view.sketches', title: 'Show or hide sketches', icon: 'sketch', keys: 'Shift H', group: 'View', run: () => setSketchesHidden(!sketchesHidden()) },
   { id: 'tab.manager', title: 'Tab manager', icon: 'tab-manager', group: 'View', run: toggleTabManager },
   { id: 'asm.insert', title: 'Insert parts', icon: 'insert', keys: 'I', group: 'Assembly', enabled: inAsm, run: openInsert },
+  { id: 'asm.pattern.linear', title: 'Linear pattern of parts', icon: 'pattern-linear', group: 'Assembly', enabled: () => inAsm() && asm().instances.length >= 1, run: () => startPattern('linear') },
+  { id: 'asm.pattern.circular', title: 'Circular pattern of parts', icon: 'pattern-circular', group: 'Assembly', enabled: () => inAsm() && asm().instances.length >= 1, run: () => startPattern('circular') },
+  { id: 'asm.replicate', title: 'Replicate', icon: 'replicate', group: 'Assembly', enabled: () => inAsm() && asm().instances.length >= 2, run: () => startReplicate() },
+  { id: 'asm.explode', title: 'Exploded view', icon: 'explode', group: 'Assembly', enabled: () => inAsm() && asm().instances.length >= 1, run: () => startExplode() },
+  { id: 'asm.position', title: 'Save named position', icon: 'position', group: 'Assembly', enabled: () => inAsm() && asm().instances.length >= 1, run: () => savePosition() },
   ...MATE_TYPES.map((t): Command => ({ id: `asm.mate.${t}`, title: `${mateTypeName(t)} mate`, icon: `mate-${t}`, keys: t === 'fastened' ? 'M' : undefined, group: 'Assembly', enabled: () => inAsm() && asm().instances.length >= 2, run: () => startMate(t) })),
   { id: 'shortcuts', title: 'Keyboard shortcuts', icon: 'search', keys: '?', group: 'View', run: () => setShortcutsOpen(true) },
   { id: 'palette', title: 'Search commands', icon: 'search', keys: 'Ctrl K', group: 'View', run: () => setPaletteOpen(true) },
@@ -165,7 +229,8 @@ export function handleKey(e: KeyboardEvent) {
   }
   if (ctrl && key === 's') {
     e.preventDefault();
-    if (inPart()) void saveDocument();
+    if (e.shiftKey) { if (notSketching()) void saveWholeDocument(); }
+    else if (inPart()) void saveDocument();
     return;
   }
   if (ctrl && key === 'o') {
@@ -195,6 +260,8 @@ export function handleKey(e: KeyboardEvent) {
       void finishSketch();
       return;
     }
+    if (ctrl && key === 'c' && s.copySelection()) return e.preventDefault();
+    if (ctrl && key === 'v' && s.pasteClipboard()) return e.preventDefault();
     if (ctrl || e.altKey) return;
     if (e.shiftKey && key === 'e') {
       void finishSketch().then(() => startFeature('extrude'));
@@ -205,11 +272,13 @@ export function handleKey(e: KeyboardEvent) {
       return;
     }
     if (e.shiftKey) {
-      const shifted: Record<string, Parameters<typeof s.setTool>[0]> = { r: 'rect-center', c: 'circle-3pt', a: 'arc-center', t: 'arc-tangent', f: 'sketch-fillet' };
+      const shifted: Record<string, Parameters<typeof s.setTool>[0]> = { r: 'rect-center', c: 'circle-3pt', a: 'arc-center', t: 'arc-tangent', f: 'sketch-fillet', p: 'polygon', m: 'mirror', o: 'offset', x: 'extend', w: 'text' };
       if (shifted[key]) return s.setTool(shifted[key]);
     }
-    const tools: Record<string, Parameters<typeof s.setTool>[0]> = { v: 'select', l: 'line', r: 'rect', c: 'circle', a: 'arc', s: 'spline', p: 'point', t: 'trim', d: 'dimension' };
+    const tools: Record<string, Parameters<typeof s.setTool>[0]> = { v: 'select', l: 'line', r: 'rect', c: 'circle', a: 'arc', s: 'spline', p: 'point', t: 'trim', d: 'dimension', o: 'slot' };
     if (tools[key]) return s.setTool(tools[key]);
+    if (s.tool[0]() === 'polygon' && (e.key === '+' || e.key === '=' || e.key === '-')) return s.morePolygonSides(e.key === '-' ? -1 : 1);
+    if (s.pattern[0]() && (e.key === '+' || e.key === '=' || e.key === '-')) return s.setPattern({ count: s.pattern[0]()!.count + (e.key === '-' ? -1 : 1) });
     if (key === 'm') return toggleSnaps();
     if (key === 'enter') return s.enterKey();
     if (key === 'escape') {

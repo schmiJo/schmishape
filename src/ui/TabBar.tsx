@@ -156,6 +156,7 @@ export function TabBar() {
             items: [
               { label: 'Create Part Studio', command: 'tab.part-studio', run: () => createTab('part-studio') },
               { label: 'Create Assembly', command: 'tab.assembly', run: () => createTab('assembly') },
+              { label: 'Create Drawing', command: 'tab.drawing', disabled: !tabs().some((t) => t.kind === 'part-studio'), run: () => createTab('drawing') },
               { label: 'Create folder', command: 'tab.folder', run: () => createTab('folder') },
             ],
           });

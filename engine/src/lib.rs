@@ -4,11 +4,12 @@
 //!
 //! Meshes come from the session's own rebuild, so nothing is built twice.
 
-use coreshape::{export, tessellate, Body, TessParams};
+use coreshape::{export, tessellate, v3, Aabb, Body, Frame, Mesh, TessParams, Vec3};
 use coreshape_document::json::{self, Value};
 use coreshape_document::Outcome;
 use coreshape_mcp::{Server, Session};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +17,8 @@ use std::sync::Arc;
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn sx_on_panic(p: *const u8, n: usize);
+    /// How far a long call has got, as the kernel's progress JSON: `{"feature":3,"stage":"solids","done":120,"total":711}`.
+    fn sx_progress(p: *const u8, n: usize);
 }
 
 struct Engine {
@@ -29,6 +32,9 @@ struct Engine {
     segment_ids: Vec<u32>,
     info: String,
     table: [u32; 14],
+    meshes: HashMap<usize, Meshed>,
+    draft_meshes: HashMap<usize, Meshed>,
+    boxes: HashMap<usize, (Arc<Body>, Aabb)>,
 }
 
 impl Engine {
@@ -44,6 +50,9 @@ impl Engine {
             segment_ids: Vec::new(),
             info: String::new(),
             table: [0; 14],
+            meshes: HashMap::new(),
+            draft_meshes: HashMap::new(),
+            boxes: HashMap::new(),
         }
     }
 
@@ -66,41 +75,112 @@ impl Engine {
         self.segment_ids.clear();
         let outcome = self.outcome(upto);
         let Some(body) = outcome.body.clone() else { return Ok((0, 0, "[]".to_string())) };
-        let size = body.aabb().diagonal();
+        let parts: Vec<(Arc<Body>, Option<Frame>, usize, usize)> = if outcome.bodies.is_empty() {
+            vec![(body.clone(), None, 0, 0)]
+        } else {
+            outcome
+                .bodies
+                .iter()
+                .map(|b| match &b.copy_of {
+                    Some(c) => (c.body.clone(), Some(c.at), b.first_face, b.first_edge),
+                    None => (b.body.clone(), None, b.first_face, b.first_edge),
+                })
+                .collect()
+        };
+        // The size sets how fine the mesh is. The whole's box took 20 s for a 711-part assembly, so it's put
+        // together from each shape's, worked out once and moved to each copy.
+        let mut whole = Aabb::EMPTY;
+        let mut boxes: HashMap<usize, (Arc<Body>, Aabb)> = HashMap::new();
+        for (source, at, _, _) in &parts {
+            let key = Arc::as_ptr(source) as usize;
+            let found = boxes.get(&key).or_else(|| self.boxes.get(&key).filter(|(b, _)| Arc::ptr_eq(b, source))).map(|(_, a)| *a);
+            let aabb = found.unwrap_or_else(|| source.aabb());
+            boxes.insert(key, (source.clone(), aabb));
+            match at {
+                None => whole.union(&aabb),
+                Some(f) => {
+                    for k in 0..8 {
+                        let pick = |bit: usize, lo: f64, hi: f64| if k & bit == 0 { lo } else { hi };
+                        let corner = v3(pick(1, aabb.min.x, aabb.max.x), pick(2, aabb.min.y, aabb.max.y), pick(4, aabb.min.z, aabb.max.z));
+                        whole.add(f.to_world(corner));
+                    }
+                }
+            }
+        }
+        self.boxes = boxes;
+        let size = whole.diagonal();
         // The kernel's display preset turns a small circle into 15 sides, which shows at CAD zoom levels.
         let params = if draft { TessParams::draft_for_size(size) } else { TessParams { chord: (size * 5e-4).max(1e-4), angle: 11f64.to_radians() } };
-        let mesh = tessellate(&body, &params).map_err(|e| e.to_string())?;
-        for p in &mesh.positions {
-            self.positions.extend_from_slice(&[p.x as f32, p.y as f32, p.z as f32]);
-        }
-        for n in &mesh.normals {
-            self.normals.extend_from_slice(&[n.x as f32, n.y as f32, n.z as f32]);
-        }
-        // Vertices aren't shared between faces, so each vertex has exactly one.
-        self.faces.resize(mesh.positions.len(), 0);
-        for (t, &f) in mesh.triangles.iter().zip(&mesh.face_of_triangle) {
-            for &v in t {
-                self.faces[v as usize] = f;
-                self.indices.push(v);
+        // Each body is meshed on its own, and a body that's a rigid copy of another, as every use of a part in a STEP
+        // assembly is, takes that one's mesh, moved. A 711-part assembly is 2,218 bodies of 273 shapes: meshed as one,
+        // it ran a browser out of memory. Meshes are kept between calls while their body stays the same, so an edit
+        // elsewhere meshes only what it changed.
+        let cache = if draft { &mut self.draft_meshes } else { &mut self.meshes };
+        let mut kept: HashMap<usize, Meshed> = HashMap::new();
+        for (source, at, first_face, first_edge) in parts {
+            let key = Arc::as_ptr(&source) as usize;
+            let meshed = match kept.get(&key).or_else(|| cache.get(&key).filter(|m| m.chord == params.chord && Arc::ptr_eq(&m.body, &source))) {
+                Some(m) => m.clone(),
+                None => {
+                    let mesh = tessellate(&source, &params).map_err(|e| e.to_string())?;
+                    // Closed surfaces are split into half faces, for robustness. The seam between two pieces of one
+                    // surface isn't a real edge: it would only clutter the view and offer a fillet that means nothing.
+                    let uses = source.edge_uses();
+                    let seam = (0..source.edges.len())
+                        .map(|e| matches!(uses[e].as_slice(), [a, b] if source.faces[a.0].surface == source.faces[b.0].surface))
+                        .collect();
+                    Meshed { body: source.clone(), chord: params.chord, mesh: Arc::new(mesh), seam: Arc::new(seam) }
+                }
+            };
+            kept.insert(key, meshed.clone());
+            let mesh = &meshed.mesh;
+            let point = |p: Vec3| at.map_or(p, |f| f.to_world(p));
+            let dir = |d: Vec3| at.map_or(d, |f| f.dir_to_world(d));
+            let base = (self.positions.len() / 3) as u32;
+            for &p in &mesh.positions {
+                let p = point(p);
+                self.positions.extend_from_slice(&[p.x as f32, p.y as f32, p.z as f32]);
+            }
+            for &n in &mesh.normals {
+                let n = dir(n);
+                self.normals.extend_from_slice(&[n.x as f32, n.y as f32, n.z as f32]);
+            }
+            // Vertices aren't shared between faces, so each vertex has exactly one.
+            let start = self.faces.len();
+            self.faces.resize(start + mesh.positions.len(), 0);
+            for (t, &f) in mesh.triangles.iter().zip(&mesh.face_of_triangle) {
+                for &v in t {
+                    self.faces[start + v as usize] = f + first_face as u32;
+                    self.indices.push(base + v);
+                }
+            }
+            for (e, line) in mesh.edge_lines.iter().enumerate() {
+                if meshed.seam[e] {
+                    continue;
+                }
+                for w in line.windows(2) {
+                    let (a, b) = (point(w[0]), point(w[1]));
+                    self.segments.extend_from_slice(&[a.x as f32, a.y as f32, a.z as f32, b.x as f32, b.y as f32, b.z as f32]);
+                    self.segment_ids.push((e + first_edge) as u32);
+                }
             }
         }
-        // Closed surfaces are split into half faces, for robustness. The seam between two pieces of one
-        // surface isn't a real edge: it would only clutter the view and offer a fillet that means nothing.
-        let uses = body.edge_uses();
-        for (e, line) in mesh.edge_lines.iter().enumerate() {
-            if matches!(uses[e].as_slice(), [a, b] if body.faces[a.0].surface == body.faces[b.0].surface) {
-                continue;
-            }
-            for w in line.windows(2) {
-                self.segments.extend_from_slice(&[w[0].x as f32, w[0].y as f32, w[0].z as f32, w[1].x as f32, w[1].y as f32, w[1].z as f32]);
-                self.segment_ids.push(e as u32);
-            }
-        }
+        *cache = kept;
         Ok((body.faces.len(), body.edges.len(), parts_json(&outcome, &body)))
     }
 }
 
-/// Each body, as `[{"name": "f3", "sheet": false, "faces": [...], "edges": [...]}]`, oldest first. The kernel puts them
+/// One body's display mesh, kept while the body is the same one, at the same fineness.
+#[derive(Clone)]
+struct Meshed {
+    body: Arc<Body>,
+    chord: f64,
+    mesh: Arc<Mesh>,
+    /// Edges that are only the seam of a closed surface, not drawn.
+    seam: Arc<Vec<bool>>,
+}
+
+/// Each body, as `[{"name": "f3", "label": "Wheel hub", "sheet": false, "faces": [...], "edges": [...]}]`, oldest first. The kernel puts them
 /// side by side in one body, so a part's faces and edges are a run of the whole's.
 fn parts_json(outcome: &Outcome, whole: &Body) -> String {
     let runs = |starts: Vec<usize>, total: usize| -> Vec<(usize, usize)> {
@@ -113,7 +193,11 @@ fn parts_json(outcome: &Outcome, whole: &Body) -> String {
         .bodies
         .iter()
         .enumerate()
-        .map(|(i, b)| format!("{{\"name\":\"{}\",\"sheet\":{},\"faces\":[{}],\"edges\":[{}]}}", b.id.text(), b.body.sheet, list(faces[i]), list(edges[i])))
+        .map(|(i, b)| {
+            // A STEP part's own name, such as "Wheel hub", for the parts list to show.
+            let label = b.name.as_ref().map_or(String::new(), |n| format!(",\"label\":{}", Value::str(n.clone()).to_text()));
+            format!("{{\"name\":\"{}\"{label},\"sheet\":{},\"faces\":[{}],\"edges\":[{}]}}", b.id.text(), b.body.sheet, list(faces[i]), list(edges[i]))
+        })
         .collect();
     format!("[{}]", items.join(","))
 }
@@ -134,6 +218,13 @@ pub extern "C" fn sx_init() {
         let message = info.to_string();
         unsafe { sx_on_panic(message.as_ptr(), message.len()) };
     }));
+    // The kernel calls this at most once per whole percent of a stage, so a long STEP import tells the page a few
+    // hundred times, through the worker, while the call itself is still running.
+    #[cfg(target_arch = "wasm32")]
+    coreshape::progress::set_hook(|p| {
+        let json = p.json();
+        unsafe { sx_progress(json.as_ptr(), json.len()) };
+    });
 }
 
 #[no_mangle]
@@ -240,5 +331,144 @@ pub extern "C" fn sx_stl() -> *const u8 {
             _ => Vec::new(),
         };
         answer(&mut e, bytes)
+    })
+}
+
+
+/// Base64, for a PDF's or PNG's bytes inside a JSON answer.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            s.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    s
+}
+
+fn vec3_of(v: Option<&Value>) -> Result<Vec3, String> {
+    match v.and_then(Value::as_array) {
+        Some([x, y, z]) => match (x.as_f64(), y.as_f64(), z.as_f64()) {
+            (Some(x), Some(y), Some(z)) => Ok(v3(x, y, z)),
+            _ => Err("a point is [x, y, z]".into()),
+        },
+        _ => Err("a point is [x, y, z]".into()),
+    }
+}
+
+// Part Studios an assembly drawing reads its parts from, by their file's text, rebuilt once and kept while it's the same.
+thread_local! {
+    static STUDIOS: RefCell<Vec<(String, coreshape_document::Document)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on the Part Studio saved as `text`, opened once and kept while it's the same, so a drawing of it rebuilds only
+/// what changed.
+fn with_studio<T>(text: &str, f: impl FnOnce(&mut coreshape_document::Document) -> Result<T, String>) -> Result<T, String> {
+    STUDIOS.with(|s| {
+        let mut s = s.borrow_mut();
+        let i = match s.iter().position(|(t, _)| t == text) {
+            Some(i) => i,
+            None => {
+                if s.len() >= 8 {
+                    s.remove(0);
+                }
+                s.push((text.to_string(), coreshape_document::Document::load_text(text).map_err(|x| x.to_string())?));
+                s.len() - 1
+            }
+        };
+        f(&mut s[i].1)
+    })
+}
+
+/// An engineering drawing, laid out by the kernel's drawing crate and written as `format` (svg, dxf, pdf or png).
+///
+/// Of a Part Studio: `{"drawing": {...}, "doc": "<.coreshape text>", "body": "f2"}`, without `body` for all its parts,
+/// and without `doc` for the one open in the session. Its dimensions' points can
+/// be sketch points or corners, looked up in a copy of the document so the session is left as it is. Of an assembly:
+/// `{"drawing": {...}, "parts": [{"doc": "<.coreshape text>", "body": "f2", "at": {"origin", "x", "y", "z"}}]}`, whose
+/// dimensions take places only. Answers `{"ok": true, "data", "scale", "notes", "width", "height"}`, with a PDF's or
+/// PNG's bytes in base64, or `{"ok": false, "error"}`.
+fn drawing(e: &mut Engine, args: &Value) -> Result<Value, String> {
+    use coreshape_drawing::{out, page, Drawing};
+    let spec = args.get("drawing").ok_or("\"drawing\" is needed")?;
+    let d = Drawing::from_json(spec).map_err(|x| x.to_string())?;
+    let format = args.get("format").and_then(Value::as_str).unwrap_or("svg");
+    let made = if let Some(parts) = args.get("parts").and_then(Value::as_array) {
+        let mut moved = Vec::new();
+        for p in parts {
+            let text = p.get("doc").and_then(Value::as_str).ok_or("each part needs its Part Studio's \"doc\"")?;
+            let name = p.get("body").and_then(Value::as_str).ok_or("each part needs its \"body\"")?;
+            let id = coreshape_document::BodyId::parse(name).map_err(|x| x.to_string())?;
+            let at = p.get("at").ok_or("each part needs \"at\"")?;
+            let frame = Frame { origin: vec3_of(at.get("origin"))?, x: vec3_of(at.get("x"))?, y: vec3_of(at.get("y"))?, z: vec3_of(at.get("z"))? };
+            let body = with_studio(text, |doc| {
+                let outcome = doc.rebuild(None);
+                let found = outcome.find_body(id).ok_or_else(|| format!("part {name} isn't there now"))?;
+                Ok(found.body.transformed(&frame))
+            })?;
+            moved.push(body);
+        }
+        if moved.is_empty() {
+            return Err("the assembly has no parts to draw".into());
+        }
+        let list: Vec<&Body> = moved.iter().collect();
+        let whole = Body::side_by_side(&list);
+        page(&d, &whole, &|_| Err(coreshape::Error::InvalidInput("a drawing of an assembly takes its dimensions' points as places, [x, y, z]".into()))).map_err(|x| x.to_string())
+    } else {
+        let draw = |doc: &mut coreshape_document::Document| -> Result<coreshape_drawing::Page, String> {
+            let outcome = doc.rebuild(None);
+            let body: Body = match args.get("body").and_then(Value::as_str) {
+                Some(name) => {
+                    let id = coreshape_document::BodyId::parse(name).map_err(|x| x.to_string())?;
+                    outcome.find_body(id).ok_or_else(|| format!("part {name} isn't there now"))?.body.as_ref().clone()
+                }
+                None => outcome.body.as_ref().ok_or("there are no parts to draw")?.as_ref().clone(),
+            };
+            let doc = RefCell::new(doc);
+            page(&d, &body, &|v| {
+                let r = coreshape_document::read_point_ref(v)?;
+                doc.borrow_mut().locate_point(&r)
+            })
+            .map_err(|x| x.to_string())
+        };
+        match args.get("doc").and_then(Value::as_str) {
+            Some(text) => with_studio(text, draw),
+            None => draw(&mut e.session.document().clone()),
+        }
+    }?;
+    let data = match format {
+        "svg" => Value::str(out::svg(&made)),
+        "dxf" => Value::str(out::dxf(&made)),
+        "pdf" => Value::str(base64(&out::pdf(&made))),
+        "png" => {
+            let dpi = args.get("dpi").and_then(Value::as_f64).filter(|d| (10.0..=1200.0).contains(d)).unwrap_or(150.0);
+            Value::str(base64(&out::png(&made, dpi / 25.4)))
+        }
+        other => return Err(format!("unknown format \"{other}\"; expected svg, dxf, pdf or png")),
+    };
+    Ok(Value::obj(vec![
+        ("ok", Value::Bool(true)),
+        ("data", data),
+        ("scale", Value::str(coreshape_drawing::format_scale(made.scale))),
+        ("width", Value::Num(made.width)),
+        ("height", Value::Num(made.height)),
+        ("notes", Value::Arr(made.notes.iter().map(Value::str).collect())),
+    ]))
+}
+
+/// Draws an engineering drawing. Takes ownership of its JSON arguments, allocated by `sx_alloc`; see [`drawing`].
+///
+/// # Safety
+/// `p` must come from `sx_alloc(n)` and hold `n` initialised bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sx_drawing(p: *mut u8, n: usize) -> *const u8 {
+    let text = String::from_utf8_lossy(&Vec::from_raw_parts(p, n, n)).into_owned();
+    ENGINE.with(|e| {
+        let mut e = e.borrow_mut();
+        let result = json::parse(&text).map_err(|w| format!("not valid JSON: {w}")).and_then(|args| drawing(&mut e, &args));
+        let value = result.unwrap_or_else(|why| Value::obj(vec![("ok", Value::Bool(false)), ("error", Value::str(why))]));
+        answer(&mut e, value.to_text().into_bytes())
     })
 }

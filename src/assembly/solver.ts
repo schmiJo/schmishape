@@ -12,7 +12,9 @@ import { add, cross, dot, quatAxis, quatFromBasis, quatMul, quatNormalize, quatR
 export interface Pose { p: V3; q: Quat }
 /** A connector in its part's own coordinates. */
 export interface Frame { o: V3; x: V3; z: V3 }
-export type MateType = 'fastened' | 'revolute' | 'slider' | 'planar' | 'cylindrical' | 'pin-slot' | 'ball' | 'parallel';
+export type MateType = 'fastened' | 'revolute' | 'slider' | 'planar' | 'cylindrical' | 'pin-slot' | 'ball' | 'parallel' | 'tangent' | 'width';
+/** The face a tangent mate's connector is on: its kind of surface, and its radius if it's round. */
+export interface Shape { surface: 'plane' | 'cylinder' | 'sphere'; radius: number }
 
 export interface SolverBody {
   id: string;
@@ -34,14 +36,17 @@ export interface SolverMate {
   /** Flips the second connector's Z, and turns it by quarter turns. */
   flip?: boolean;
   quarter?: number;
+  /** For a tangent mate: the faces the connectors are on. */
+  sa?: Shape;
+  sb?: Shape;
 }
 export interface MateFailure { mate: string; reason: string }
 export interface SolveResult { poses: Map<string, Pose>; failed: MateFailure[]; dof: number; residual: number }
 
 export const IDENTITY: Pose = { p: [0, 0, 0], q: [0, 0, 0, 1] };
-export const MATE_DOF: Record<MateType, number> = { fastened: 0, revolute: 1, slider: 1, planar: 3, cylindrical: 2, 'pin-slot': 2, ball: 3, parallel: 4 };
+export const MATE_DOF: Record<MateType, number> = { fastened: 0, revolute: 1, slider: 1, planar: 3, cylindrical: 2, 'pin-slot': 2, ball: 3, parallel: 4, tangent: 4, width: 5 };
 const TOL = 1e-7;
-const NAMES: Record<MateType, string> = { fastened: 'Fastened', revolute: 'Revolute', slider: 'Slider', planar: 'Planar', cylindrical: 'Cylindrical', 'pin-slot': 'Pin slot', ball: 'Ball', parallel: 'Parallel' };
+const NAMES: Record<MateType, string> = { fastened: 'Fastened', revolute: 'Revolute', slider: 'Slider', planar: 'Planar', cylindrical: 'Cylindrical', 'pin-slot': 'Pin slot', ball: 'Ball', parallel: 'Parallel', tangent: 'Tangent', width: 'Width' };
 export const mateTypeName = (t: MateType) => NAMES[t];
 
 interface WorldFrame { o: V3; x: V3; y: V3; z: V3 }
@@ -201,7 +206,12 @@ function mateRows(sys: System, m: SolverMate): Row[] {
       rows.push(row);
     }
   };
+  if (m.type === 'tangent') return tangentRows(sys, m);
   switch (m.type) {
+    case 'width':
+      // Only the second connector's origin, on the first's xy plane: between two faces each, a tab centred in a slot.
+      alongA(A.z);
+      break;
     case 'fastened':
       AXES.forEach(along);
       aligned(A.z, B.z);
@@ -239,6 +249,99 @@ function mateRows(sys: System, m: SolverMate): Row[] {
       break;
   }
   return rows;
+}
+
+/**
+ * How many ways a tangent mate leaves its parts to move, by the faces it's between: two planes slide and turn on each
+ * other, a cylinder can also roll, and a ball can turn every way.
+ */
+export function tangentFreedom(sa?: Shape, sb?: Shape) {
+  if (!sa || !sb) return MATE_DOF.tangent;
+  const kinds = [sa.surface, sb.surface].sort().join();
+  return ({ 'plane,plane': 3, 'cylinder,plane': 4, 'cylinder,cylinder': 4, 'plane,sphere': 5, 'cylinder,sphere': 5, 'sphere,sphere': 5 } as Record<string, number>)[kinds] ?? 4;
+}
+
+/**
+ * A tangent mate: whatever keeps two faces touching, from the shapes of the faces its connectors are on, as the
+ * kernel's is. A flat face's connector has Z along its outward normal, a cylinder's along its axis with its origin on
+ * it, and a ball's origin at its center. The other part goes outside a flat face, and round faces go outside each other;
+ * flip takes the other side, or one inside the other.
+ */
+function tangentRows(sys: System, m: SolverMate): Row[] {
+  // The equations are written with the flat face first, then a cylinder, then a ball.
+  const order = { plane: 0, cylinder: 1, sphere: 2 };
+  const sa = m.sa ?? { surface: 'plane', radius: 0 }, sb = m.sb ?? { surface: 'plane', radius: 0 };
+  const swap = order[sb.surface] < order[sa.surface];
+  const [ida, idb, fa, fb, shA, shB] = swap ? [m.b, m.a, m.fb, m.fa, sb, sa] : [m.a, m.b, m.fa, m.fb, sa, sb];
+  const A = worldFrame(sys.poses.get(ida)!, fa), B = worldFrame(sys.poses.get(idb)!, fb);
+  const ca = centerOf(sys, ida), cb = centerOf(sys, idb);
+  const rows: Row[] = [];
+  const S = sys.angular;
+  /** A row of the value and its gradient: points move and turn with their part, directions only turn. */
+  const row = (value: number, terms: { id: string; at?: V3; c?: V3; dir?: V3; g: V3 }[]) => {
+    const r: Row = { value, coef: new Map() };
+    for (const t of terms) {
+      if (t.at) addCoef(r, sys, t.id, t.g, cross(sub(t.at, t.c!), t.g));
+      else addCoef(r, sys, t.id, null, cross(t.dir!, t.g));
+    }
+    rows.push(r);
+  };
+  const side = m.flip ? -1 : 1;
+  /** The distance of a point of B's from A's plane, which should be `r` on the side the normal points. */
+  const offPlane = (r: number) => {
+    const d = sub(B.o, A.o);
+    row(dot(d, A.z) - side * r, [{ id: idb, at: B.o, c: cb, g: A.z }, { id: ida, at: A.o, c: ca, g: scale(A.z, -1) }, { id: ida, dir: A.z, g: d }]);
+  };
+  /** How far a point of B's is from A's axis, less `r`. */
+  const offAxis = (r: number) => {
+    const d = sub(B.o, A.o);
+    const w = sub(d, scale(A.z, dot(d, A.z)));
+    const len = Math.hypot(w[0], w[1], w[2]);
+    const n = len > 1e-9 ? scale(w, 1 / len) : sideways(A.z);
+    row(len - r, [{ id: idb, at: B.o, c: cb, g: n }, { id: ida, at: A.o, c: ca, g: scale(n, -1) }, { id: ida, dir: A.z, g: scale(n, -dot(d, A.z)) }]);
+  };
+  const kinds = `${shA.surface},${shB.surface}`;
+  if (kinds === 'plane,plane') {
+    // Face to face: on the plane, normals opposite, or the same way when flipped.
+    offPlane(0);
+    const want = scale(B.z, -side);
+    for (const e of AXES) row(S * dot(sub(want, A.z), e), [{ id: idb, dir: want, g: scale(e, S) }, { id: ida, dir: A.z, g: scale(e, -S) }]);
+  } else if (kinds === 'plane,cylinder') {
+    // A cylinder lies level on a plane: its axis square to the normal, the radius off it.
+    offPlane(shB.radius);
+    const c = cross(B.z, A.z);
+    if (Math.hypot(c[0], c[1], c[2]) > 1e-3) row(S * dot(A.z, B.z), [{ id: idb, dir: B.z, g: scale(A.z, S) }, { id: ida, dir: A.z, g: scale(B.z, S) }]);
+    else {
+      // Standing straight up, a dot product has no slope to follow, so it's told to tip over about the cylinder's own Y.
+      const y = cross(B.z, B.x);
+      const r: Row = { value: S * dot(A.z, B.z), coef: new Map() };
+      addCoef(r, sys, idb, null, scale(y, S));
+      addCoef(r, sys, ida, null, scale(y, -S));
+      rows.push(r);
+    }
+  } else if (kinds === 'plane,sphere') {
+    offPlane(shB.radius);
+  } else if (kinds === 'cylinder,cylinder') {
+    // Axes parallel, either way round, and the radii apart: added outside, or the difference one inside the other.
+    const along = dot(A.z, B.z) < 0 ? scale(B.z, -1) : B.z;
+    for (const e of AXES) row(S * dot(sub(along, A.z), e), [{ id: idb, dir: along, g: scale(e, S) }, { id: ida, dir: A.z, g: scale(e, -S) }]);
+    offAxis(m.flip ? Math.abs(shA.radius - shB.radius) : shA.radius + shB.radius);
+  } else if (kinds === 'cylinder,sphere') {
+    offAxis(m.flip ? Math.abs(shA.radius - shB.radius) : shA.radius + shB.radius);
+  } else {
+    const d = sub(B.o, A.o);
+    const len = Math.hypot(d[0], d[1], d[2]);
+    const n = len > 1e-9 ? scale(d, 1 / len) : sideways(A.z);
+    row(len - (m.flip ? Math.abs(shA.radius - shB.radius) : shA.radius + shB.radius), [{ id: idb, at: B.o, c: cb, g: n }, { id: ida, at: A.o, c: ca, g: scale(n, -1) }]);
+  }
+  return rows;
+}
+
+/** A direction square to `z`, any one. */
+function sideways(z: V3): V3 {
+  const pick: V3 = Math.abs(z[0]) > 0.9 ? [0, 1, 0] : [1, 0, 0];
+  const s = sub(pick, scale(z, dot(pick, z)));
+  return scale(s, 1 / Math.hypot(s[0], s[1], s[2]));
 }
 
 const allRows = (sys: System, mates: SolverMate[]) => mates.flatMap((m) => mateRows(sys, m));
@@ -323,7 +426,7 @@ function largestTurn(sys: System, step: Float64Array) {
 function settle(sys: System, mates: SolverMate[], iterations = 80): boolean {
   // Exactly opposite axes are a dead spot for the equations, so a part sitting there gets a nudge out of it.
   for (const m of mates) {
-    if (m.type === 'ball') continue;
+    if (m.type === 'ball' || m.type === 'tangent' || m.type === 'width') continue;
     const A = worldFrame(sys.poses.get(m.a)!, m.fa);
     const B = worldFrame(sys.poses.get(m.b)!, adjustedFrame(m.fb, m.flip, m.quarter));
     if (dot(A.z, B.z) < -0.9999) {

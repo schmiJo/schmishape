@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createSignal, For, Match, Show, Switch } from 'solid-js';
 import { removeFace, removeSection, regionsTakeFaces, setValueAt, acceptDialog, activatePick, activeDef, activePick, canonical, cancelDialog, clearRegions, dialogBusy, dialogError, dialogMissing, dialogName, editingId, hasLaterFeatures, nothingPicked, pickBase, removeRegions, setValue, showingFinal, toggleFinal, values, takesRegions } from '../features/dialog';
-import { AXIS_CHOICES, newStep, type FieldDef, type PathStep, type Section } from '../features/defs';
+import { AXIS_CHOICES, newStep, SINGLE_KINDS, type FieldDef, type PathStep, type Section } from '../features/defs';
+import { edgeWords, lineWords, pathWords, planeWords, pointWords } from '../features/refs';
 import { edgeWord, faceWord, fmtNum, partLabel } from '../features/words';
 import { sameRegions, sketchLines, wholeSketch, type RegionPick } from '../sketch/regions';
 import { doc, isHidden, isSketchFeature, numberOr, partLooks, sketchRegions } from '../store/doc';
@@ -146,6 +147,8 @@ function CheckField(props: { field: FieldDef; off?: boolean; changed?: (on: bool
 function GroupField(props: { field: FieldDef; off?: boolean }) {
   const turnedOn = () => !props.field.checkable || (!!values[props.field.key] && !props.field.disabled?.(values));
   const [open, setOpen] = createSignal(!!props.field.checkable && !!values[props.field.key]);
+  // A group ticked by what's read in, as when editing, opens to show it.
+  createEffect(() => { if (props.field.checkable && values[props.field.key]) setOpen(true); });
   const shown = () => open() && !props.field.disabled?.(values);
   return (
     <div class="field-group" data-group={props.field.key}>
@@ -170,10 +173,35 @@ function SketchField(props: { field: FieldDef }) {
     <>
       <label class="field">
         <span class="field-label">{props.field.label}</span>
-        <select class="select" value={String(values[props.field.key] ?? '')} onChange={(e) => setValue(props.field.key, Number(e.currentTarget.value))}>
+        <select class="select" data-field={props.field.key} value={String(values[props.field.key] ?? '')} onChange={(e) => setValue(props.field.key, Number(e.currentTarget.value))}>
+          {/* With none chosen yet, the first sketch would look chosen and choosing it would change nothing. */}
+          <Show when={values[props.field.key] === null || values[props.field.key] === undefined}><option value="" selected disabled>Choose a sketch</option></Show>
           <For each={sketches()}>{(s) => <option value={String(s.id)} selected={values[props.field.key] === s.id}>{s.name}</option>}</For>
         </select>
       </label>
+      <Show when={props.field.hint}><p class="field-hint">{props.field.hint}</p></Show>
+    </>
+  );
+}
+
+/** Several sketches, ticked in a list, such as a loft's guides. */
+function SketchesField(props: { field: FieldDef }) {
+  const sketches = () => doc.features.filter((f) => isSketchFeature(f) && !isHidden(f) && f.id !== editingId());
+  const chosen = () => (values[props.field.key] ?? []) as number[];
+  const toggle = (id: number) => setValue(props.field.key, chosen().includes(id) ? chosen().filter((x) => x !== id) : [...chosen(), id]);
+  return (
+    <>
+      <div class="sketch-list" data-field={props.field.key}>
+        <span class="field-label">{props.field.label}</span>
+        <For each={sketches()} fallback={<p class="field-hint">There are no sketches.</p>}>
+          {(s) => (
+            <label class="sketch-pick">
+              <input type="checkbox" checked={chosen().includes(s.id as number)} data-sketch={s.id} onChange={() => toggle(s.id as number)} />
+              <span>{s.name}</span>
+            </label>
+          )}
+        </For>
+      </div>
       <Show when={props.field.hint}><p class="field-hint">{props.field.hint}</p></Show>
     </>
   );
@@ -225,7 +253,7 @@ function PickField(props: { field: FieldDef }) {
   const kind = props.field.kind;
   const raw = () => JSON.parse(JSON.stringify(values[key] ?? null));
   const list = (): any[] => (Array.isArray(raw()) ? raw() : raw() === null ? [] : [raw()]);
-  const single = kind === 'face' || kind === 'part' || kind === 'vertex';
+  const single = SINGLE_KINDS.has(kind);
   const without = (i: number) => setValue(key, single ? null : list().filter((_, at) => at !== i));
   const rows = createMemo<PickRow[]>(() => {
     const base = pickBase();
@@ -236,14 +264,30 @@ function PickField(props: { field: FieldDef }) {
         return { name: edgeWord(e?.curve), size: e ? `${fmtNum(e.length)} mm` : '', remove };
       }
       if (kind === 'part' || kind === 'parts') return { name: base ? partLabel(base.mesh.parts, item, partLooks()) : item, size: '', remove };
+      if (kind === 'features') return { name: doc.features.find((f) => f.id === item)?.name ?? `Feature ${item}`, size: '', remove };
       if (kind === 'vertex') return { name: 'Vertex', size: fmtPoint(item.near ?? item.point), remove };
+      if (kind === 'plane' || kind === 'planes' || (kind === 'face' && typeof item !== 'string')) return { ...planeWords(item, base?.faces), remove };
+      if (kind === 'face' && props.field.takesPlanes && ['top', 'front', 'right'].includes(item)) return { ...planeWords(item, base?.faces), remove };
+      if (kind === 'point' || kind === 'points') return { ...pointWords(item), name: `${kind === 'points' ? `${i + 1}. ` : ''}${pointWords(item).name}`, remove };
+      if (kind === 'line') return { ...lineWords(item, base?.faces, base?.edges), remove };
+      if (kind === 'edge') return { ...edgeWords(item, base?.edges), remove };
+      if (kind === 'path') return { ...pathWords(item, base?.edges), remove };
       // One name can cover several faces, such as a pattern's copies.
       const faces = base?.faces.filter((x) => x.name === item || x.key === item) ?? [];
       return { name: faceWord(faces[0]?.surface), size: faces.length ? `${fmtNum(faces.reduce((t, f) => t + f.area, 0))} mm²` : '', remove };
     });
   });
-  const prompt = { edges: 'Click edges in the view', faces: 'Click faces in the view', face: 'Click a face in the view', part: 'Click a part in the view', parts: 'Click parts in the view', vertex: 'Click an edge near its end' }[kind as string] ?? '';
-  return <PickBox field={props.field} prompt={prompt} rows={rows()} waiting={rows().length === 0} clear={() => setValue(key, single ? null : [])} />;
+  const many = props.field.max ? `${props.field.max} ` : '';
+  const prompt = {
+    edges: 'Click edges in the view', faces: 'Click faces in the view', face: props.field.takesPlanes ? 'Click a face or a plane' : 'Click a face in the view', part: 'Click a part in the view',
+    parts: 'Click parts in the view', vertex: 'Click an edge near its end', features: 'Click features in the list, or a face they made',
+    plane: 'Click a plane or a flat face, in the view or the list', planes: `Click ${many}planes or flat faces`, point: 'Click a corner, a sketch point or the origin',
+    points: `Click ${many}points: corners, sketch points or the origin`, line: 'Click an edge, a sketch line, or something round for its axis', edge: 'Click an edge in the view',
+    path: 'Click a sketch’s curves, or a part’s edges',
+  }[kind as string] ?? '';
+  // A box that takes a set number says how many are still wanted.
+  const waiting = () => rows().length < (props.field.max ?? 1);
+  return <PickBox field={props.field} prompt={prompt} rows={rows()} waiting={waiting()} clear={() => setValue(key, single ? null : [])} />;
 }
 
 function RegionField(props: { field: FieldDef }) {
@@ -373,7 +417,8 @@ function FieldList(props: { fields: FieldDef[]; off?: boolean }) {
             <Match when={f.kind === 'check'}><CheckField field={f} off={props.off} /></Match>
             <Match when={f.kind === 'group'}><GroupField field={f} off={props.off} /></Match>
             <Match when={f.kind === 'sketch'}><SketchField field={f} /></Match>
-            <Match when={['edges', 'faces', 'face', 'part', 'parts', 'vertex'].includes(f.kind)}><PickField field={f} /></Match>
+            <Match when={f.kind === 'sketches'}><SketchesField field={f} /></Match>
+            <Match when={['edges', 'faces', 'face', 'part', 'parts', 'vertex', 'features', 'plane', 'planes', 'point', 'points', 'line', 'edge', 'path'].includes(f.kind)}><PickField field={f} /></Match>
             <Match when={f.kind === 'regions'}><RegionField field={f} /></Match>
             <Match when={f.kind === 'sections'}><SectionsField field={f} /></Match>
             <Match when={f.kind === 'axis'}><AxisField field={f} /></Match>

@@ -1,6 +1,7 @@
 import earcut from 'earcut';
 import { engine } from '../engine/client';
 import { segPoints, type V2 } from './geometry';
+import { textOutlinesOf } from './text';
 
 /** A closed area a sketch's curves make, ready to draw and to pick. */
 export interface SketchRegion {
@@ -45,9 +46,13 @@ export interface SketchLine { id: number; start: V2; end: V2; construction: bool
 /** One region of one sketch, as a dialog picks it. */
 export interface RegionPick { sketch: number; id: string }
 
-interface Solved { regions: SketchRegion[]; lines: SketchLine[] }
+interface Solved { regions: SketchRegion[]; lines: SketchLine[]; texts: V2[][] }
 let known = new Map<string, Solved>();
 let linesBySketch = new Map<number, SketchLine[]>();
+let textsBySketch = new Map<number, V2[][]>();
+
+/** A sketch's texts, as pieces of line round their letters, where its constraints put them. */
+export const sketchTexts = (sketchId: number) => textsBySketch.get(sketchId) ?? [];
 
 /** A sketch's straight lines, where its constraints put them. */
 export const sketchLines = (sketchId: number) => linesBySketch.get(sketchId) ?? [];
@@ -64,6 +69,7 @@ export async function loadRegions(features: any[], env: Record<string, number>) 
   const next = new Map<string, Solved>();
   const out = new Map<number, SketchRegion[]>();
   const lines = new Map<number, SketchLine[]>();
+  const texts = new Map<number, V2[][]>();
   for (const [position, f] of features.entries()) {
     if (f.type !== 'constrained_sketch' || (f.name ?? '').startsWith('~')) continue;
     // Geometry projected from a part depends on the parts before the sketch, so those sketches are never taken from the cache.
@@ -75,13 +81,16 @@ export async function loadRegions(features: any[], env: Record<string, number>) 
       const solved = await engine.call('sketch_solve', { sketch: f.sketch, parameters: env, ...where });
       const sketch = solved.ok ? JSON.parse(solved.text).sketch : f.sketch;
       const r = await engine.call('sketch_arrangement', { sketch, ...where });
-      got = { regions: r.ok ? (JSON.parse(r.text).regions as any[]).map(readRegion) : [], lines: readLines(sketch) };
+      const raw: any[] = r.ok ? JSON.parse(r.text).regions : [];
+      got = { regions: raw.map(readRegion), lines: readLines(sketch), texts: [...textOutlinesOf(sketch, raw).values()].flat() };
     }
     next.set(key, got);
     out.set(f.id, got.regions);
     lines.set(f.id, got.lines);
+    texts.set(f.id, got.texts);
   }
   linesBySketch = lines;
+  textsBySketch = texts;
   known = next;
   return out;
 }

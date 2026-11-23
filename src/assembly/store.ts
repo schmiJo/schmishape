@@ -3,8 +3,9 @@ import { setDoc, setMesh, storage } from '../store/doc';
 import { assemblyHooks, tabById, tabDocumentText, tabs } from '../store/tabs';
 import { setHoverText, setSelection, toast } from '../store/ui';
 import { bakeParts, ownerOf, type Baked } from './bake';
-import { findSpot } from './connectors';
-import { emptyAssembly, parseAssembly, type AssemblyData, type ConnectorRef, type InstanceData, type MateData } from './model';
+import { betweenFrame, findSpot, shapeOf } from './connectors';
+import { emptyAssembly, parseAssembly, type AssemblyData, type ConnectorRef, type ExplodeData, type InstanceData, type MateData, type PatternData, type ReplicateData } from './model';
+import { derivedCopies, explodeShifts, replicatePlaces } from './extras';
 import { knownStudio, loadStudio, type PartMesh } from './parts';
 import { dragTo, IDENTITY, mateTypeName, snapFirst, snapSecond, solve, type DragGoal, type MateType, type SolverBody, type SolverMate } from './solver';
 
@@ -38,6 +39,8 @@ export interface MateDraft {
   suppressed: boolean;
   /** The whole assembly as it was, for Cancel. */
   before: string;
+  /** A width mate's first face of a pair, waiting for the face across from it. */
+  half?: PickedConnector | null;
   error: string | null;
 }
 export const [mateDraft, setMateDraft] = createSignal<MateDraft | null>(null);
@@ -84,7 +87,9 @@ function solverBodies(data: AssemblyData): SolverBody[] {
   return out;
 }
 
-const toSolverMate = (m: MateData): SolverMate => ({ id: m.id, name: m.name, type: m.type, a: m.a, b: m.b, fa: m.ca.frame, fb: m.cb.frame, flip: m.flip, quarter: m.quarter });
+/** Each tangent mate's faces, as last found, so a drag solves it as the mate does. */
+const shapes = new Map<string, Pick<SolverMate, 'sa' | 'sb'>>();
+const toSolverMate = (m: MateData): SolverMate => ({ id: m.id, name: m.name, type: m.type, a: m.a, b: m.b, fa: m.ca.frame, fb: m.cb.frame, flip: m.flip, quarter: m.quarter, ...(m.type === 'tangent' ? shapes.get(m.id) : {}) });
 
 /** Finds each connector again, since its part may have changed, and gathers the mates that can be solved. */
 function liveMates(data: AssemblyData, failures: Map<string, string>): SolverMate[] {
@@ -106,6 +111,16 @@ function liveMates(data: AssemblyData, failures: Map<string, string>): SolverMat
     }
     m.ca = { ...m.ca, frame: fa };
     m.cb = { ...m.cb, frame: fb };
+    if (m.type === 'tangent') {
+      const sa = shapeOf(pa, m.ca), sb = shapeOf(pb, m.cb);
+      if (!sa || !sb) {
+        failures.set(m.id, `A tangent mate’s connectors go on flat, cylindrical or spherical faces, and its ${!sa ? 'first' : 'second'} isn’t on one. Edit this mate to pick another.`);
+        continue;
+      }
+      shapes.set(m.id, { sa, sb });
+      out.push({ ...toSolverMate(m), sa, sb });
+      continue;
+    }
     out.push(toSolverMate(m));
   }
   return out;
@@ -135,17 +150,38 @@ function resolve(data: AssemblyData, light?: string[]) {
 }
 
 const publish = (data: AssemblyData) => setAsm({ ...data, instances: data.instances.map((i) => ({ ...i })), mates: data.mates.map((m) => ({ ...m })) });
+
+/** The exploded view on show, and how far, 0 to 1. Only for showing: nothing is moved for good. */
+export const [shownExplode, setShownExplode] = createSignal<{ id: string; amount: number } | null>(null);
+/** The copies patterns and replicates place just now. */
+export const [copies, setCopies] = createSignal<ReturnType<typeof derivedCopies>>([]);
 const save = () => { if (here) storage.set(assemblyKey(here), JSON.stringify(asm())); };
 
 /** Everything on show, as one mesh for the viewport. */
 export function rebake() {
   const items: { part: PartMesh; pose: InstanceData['pose'] }[] = [];
   bakedIds = [];
-  for (const i of asm().instances) {
+  const data = asm();
+  const made = derivedCopies(data, partOf);
+  setCopies(made);
+  const ex = shownExplode();
+  const shifts = ex ? explodeShifts(data, ex.id, ex.amount) : new Map();
+  const shifted = (id: string, seed: string, pose: InstanceData['pose']) => {
+    const d = shifts.get(id) ?? shifts.get(seed);
+    return d ? { p: [pose.p[0] + d[0], pose.p[1] + d[1], pose.p[2] + d[2]] as [number, number, number], q: pose.q } : pose;
+  };
+  for (const i of data.instances) {
     const part = partOf(i);
     if (!part || i.hidden) continue;
-    items.push({ part, pose: i.pose });
+    items.push({ part, pose: shifted(i.id, i.id, i.pose) });
     bakedIds.push(i.id);
+  }
+  // Copies come after the instances, and can't be picked: they follow their instances, as in Onshape.
+  for (const c of made) {
+    const part = partOf(c.of);
+    if (!part) continue;
+    items.push({ part, pose: shifted(c.id, c.of.id, c.pose) });
+    bakedIds.push(c.id);
   }
   baked = bakeParts(items);
   setMesh(baked.mesh);
@@ -216,7 +252,7 @@ function showSaved(text: string) {
 export function asmUndo() {
   const s = stack();
   const text = s.undo.pop();
-  if (text === undefined || mateDraft()) {
+  if (text === undefined || mateDraft() || extraDraft()) {
     if (text !== undefined) s.undo.push(text);
     return;
   }
@@ -266,6 +302,8 @@ async function enterAssembly(tab: string) {
 
 function leaveAssembly() {
   if (mateDraft()) cancelMate();
+  if (extraDraft()) cancelExtra();
+  setShownExplode(null);
   save();
   setSelectedInstances([]);
   setSelectedMate(null);
@@ -350,6 +388,10 @@ export function deleteInstances(ids: string[]) {
   change((data) => {
     data.instances = data.instances.filter((i) => !ids.includes(i.id));
     data.mates = data.mates.filter((m) => !ids.includes(m.a) && !ids.includes(m.b));
+    // Patterns, replicates and explode steps let go of them, and go if nothing's left.
+    data.patterns = data.patterns?.map((p) => ({ ...p, of: p.of.filter((x) => !ids.includes(x)) })).filter((p) => p.of.length && (typeof p.axis === 'string' || !ids.includes(p.axis.instance)));
+    data.replicates = data.replicates?.map((r) => ({ ...r, of: r.of.filter((x) => !ids.includes(x)) })).filter((r) => r.of.length && !ids.includes(r.target));
+    data.explodes = data.explodes?.map((e) => ({ ...e, steps: e.steps.map((st) => ({ ...st, instances: st.instances.filter((x) => !ids.includes(x)) })).filter((st) => st.instances.length) }));
   });
   selectInstances([]);
   if (gone) toast(`Its ${gone === 1 ? 'mate went' : `${gone} mates went`} with it. Ctrl Z brings them back.`);
@@ -455,6 +497,7 @@ export function updateDraft(change: Partial<MateDraft>) {
   if (!draft) return;
   const next = { ...draft, ...change };
   if (change.type && !draft.editing) next.name = firstFreeMateName(parseAssembly(draft.before), change.type);
+  if (change.type) next.half = null;
   setMateDraft(next);
   previewDraft();
 }
@@ -463,6 +506,31 @@ export function updateDraft(change: Partial<MateDraft>) {
 export function pickConnector(picked: PickedConnector) {
   const draft = mateDraft();
   if (!draft) return;
+  if (draft.type === 'width' && picked.connector.kind === 'face') {
+    // A width mate's connectors are each midway between two faces: the first click waits for the face across from it.
+    const inst = asm().instances.find((i) => i.id === picked.instance);
+    const part = inst && partOf(inst);
+    const face = part?.faces.find((f) => f.key === picked.connector.ref);
+    const half = draft.half;
+    if (half && half.instance === picked.instance && part) {
+      if (half.connector.ref === picked.connector.ref) {
+        // The same face twice: that face's own connector, as any mate takes one.
+        setMateDraft({ ...draft, half: null });
+        picked = half;
+      } else {
+        const frame = betweenFrame(part, half.connector.ref, picked.connector.ref);
+        if (!frame) {
+          toast('The face across has to be flat and parallel to the first.');
+          return;
+        }
+        setMateDraft({ ...draft, half: null });
+        picked = { instance: picked.instance, connector: { kind: 'between', ref: `${half.connector.ref}|${picked.connector.ref}`, how: 'between', frame } };
+      }
+    } else if (face?.surface === 'plane' && (!draft.first || draft.first.instance !== picked.instance || draft.second)) {
+      setMateDraft({ ...draft, half: picked });
+      return;
+    }
+  }
   if (!draft.first) return updateDraft({ first: picked });
   if (picked.instance === draft.first.instance) {
     toast('Pick a connector on a different part.');
@@ -505,3 +573,185 @@ export function deleteMate(id: string) {
 }
 
 export { edgeSpots, faceSpots } from './connectors';
+
+// Patterns, replicates, exploded views and named positions
+
+export type ExtraDraft =
+  | { kind: 'pattern'; item: PatternData; editing: boolean; before: string; picking: boolean }
+  | { kind: 'replicate'; item: ReplicateData | (Omit<ReplicateData, 'connector'> & { connector: ConnectorRef | null }); editing: boolean; before: string; picking: boolean }
+  | { kind: 'explode'; item: ExplodeData; editing: boolean; before: string; picking: false };
+export const [extraDraft, setExtraDraft] = createSignal<ExtraDraft | null>(null);
+
+function nextName(list: { name: string }[], base: string) {
+  const names = new Set(list.map((x) => x.name));
+  let n = 1;
+  while (names.has(`${base} ${n}`)) n++;
+  return `${base} ${n}`;
+}
+
+/** Puts the draft into the assembly as it was before the dialog, and shows it. */
+function previewExtra() {
+  const d = extraDraft();
+  if (!d) return;
+  const data = parseAssembly(d.before);
+  if (d.kind === 'pattern') data.patterns = [...(data.patterns ?? []).filter((p) => p.id !== d.item.id), d.item];
+  if (d.kind === 'replicate' && d.item.connector) data.replicates = [...(data.replicates ?? []).filter((p) => p.id !== d.item.id), d.item as ReplicateData];
+  if (d.kind === 'explode') data.explodes = [...(data.explodes ?? []).filter((p) => p.id !== d.item.id), d.item];
+  resolve(data);
+  publish(data);
+  rebake();
+}
+
+export function updateExtra(change: Record<string, unknown>, picking?: boolean) {
+  const d = extraDraft();
+  if (!d) return;
+  setExtraDraft({ ...d, item: { ...d.item, ...change }, ...(picking === undefined ? {} : { picking }) } as ExtraDraft);
+  previewExtra();
+}
+
+function openExtra(d: ExtraDraft) {
+  if (mateDraft()) cancelMate();
+  if (extraDraft()) cancelExtra();
+  setInsertOpen(false);
+  setExtraDraft(d);
+  previewExtra();
+}
+
+export function startPattern(type: 'linear' | 'circular') {
+  const data = asm();
+  const of = selectedInstances().filter((id) => data.instances.some((i) => i.id === id));
+  const id = `p${data.next}`;
+  openExtra({ kind: 'pattern', editing: false, before: snapshot(), picking: false, item: { id, name: nextName(data.patterns ?? [], type === 'linear' ? 'Linear pattern' : 'Circular pattern'), of, type, axis: type === 'linear' ? 'x' : 'z', spacing: 20, degrees: 60, count: type === 'linear' ? 3 : 6, suppressed: false } });
+}
+
+export function startReplicate() {
+  const data = asm();
+  const of = selectedInstances().filter((id) => data.instances.some((i) => i.id === id));
+  openExtra({ kind: 'replicate', editing: false, before: snapshot(), picking: true, item: { id: `r${data.next}`, name: nextName(data.replicates ?? [], 'Replicate'), of, target: '', connector: null, suppressed: false } });
+}
+
+export function startExplode() {
+  const data = asm();
+  const sel = selectedInstances();
+  openExtra({ kind: 'explode', editing: false, before: snapshot(), picking: false, item: { id: `x${data.next}`, name: nextName(data.explodes ?? [], 'Exploded view'), steps: sel.length ? [{ instances: sel, shift: [0, 0, 30] }] : [] } });
+  setShownExplode({ id: `x${data.next}`, amount: 1 });
+  rebake();
+}
+
+export function editExtra(kind: 'pattern' | 'replicate' | 'explode', id: string) {
+  const data = asm();
+  const list = kind === 'pattern' ? data.patterns : kind === 'replicate' ? data.replicates : data.explodes;
+  const item = list?.find((x) => x.id === id);
+  if (!item) return;
+  openExtra({ kind, editing: true, before: snapshot(), picking: false, item: JSON.parse(JSON.stringify(item)) } as ExtraDraft);
+  if (kind === 'explode') {
+    setShownExplode({ id, amount: 1 });
+    rebake();
+  }
+}
+
+/** A part clicked while a pattern, replicate or exploded view is open goes in or out of it. */
+export function toggleExtraInstance(id: string) {
+  const d = extraDraft();
+  if (!d || d.picking) return;
+  if (d.kind === 'explode') return;
+  const of = d.item.of.includes(id) ? d.item.of.filter((x) => x !== id) : [...d.item.of, id];
+  if (d.kind === 'replicate' && id === d.item.target) return toast('That’s the part the copies go on.');
+  updateExtra({ of });
+}
+
+/** A connector clicked for a pattern's axis or a replicate's place. */
+export function pickExtraConnector(picked: PickedConnector) {
+  const d = extraDraft();
+  if (!d || !d.picking) return;
+  if (d.kind === 'pattern') return updateExtra({ axis: { instance: picked.instance, connector: picked.connector } }, false);
+  if (d.kind === 'replicate') {
+    if (d.item.of.includes(picked.instance)) return toast('Click a face of the part the copies go on, not of one being copied.');
+    const inst = instanceById(picked.instance);
+    const part = inst && partOf(inst);
+    if (picked.connector.kind !== 'face' || !part) return toast('Click a face, such as the hole a screw is in.');
+    if (!replicatePlaces(part, picked.connector).length) toast('That part has no other face like this one, so there’s nowhere to put copies.');
+    updateExtra({ target: picked.instance, connector: picked.connector }, false);
+  }
+}
+
+/** Why the draft can't be kept yet, if it can't. */
+export function extraMissing(): string | null {
+  const d = extraDraft();
+  if (!d) return null;
+  if (d.kind === 'explode') return d.item.steps.length ? null : 'Select parts and add a step';
+  if (!d.item.of.length) return 'Click the parts to copy';
+  if (d.kind === 'pattern') return d.item.count >= 2 ? null : 'A pattern needs two or more';
+  return d.item.connector ? null : 'Click the face the copies go at, such as a hole';
+}
+
+export function acceptExtra() {
+  const d = extraDraft();
+  if (!d || extraMissing()) return;
+  setExtraDraft(null);
+  const data = asm();
+  if (!d.editing) data.next = Math.max(data.next, Number(d.item.id.slice(1)) + 1);
+  publish(data);
+  commit(d.before);
+  if (d.kind === 'explode') setShownExplode(null);
+  rebake();
+}
+
+export function cancelExtra() {
+  const d = extraDraft();
+  if (!d) return;
+  setExtraDraft(null);
+  if (d.kind === 'explode') setShownExplode(null);
+  const data = parseAssembly(d.before);
+  resolve(data);
+  publish(data);
+  rebake();
+}
+
+export function deleteExtra(kind: 'pattern' | 'replicate' | 'explode' | 'position', id: string) {
+  if (shownExplode()?.id === id) setShownExplode(null);
+  change((data) => {
+    if (kind === 'pattern') data.patterns = data.patterns?.filter((x) => x.id !== id);
+    if (kind === 'replicate') data.replicates = data.replicates?.filter((x) => x.id !== id);
+    if (kind === 'explode') data.explodes = data.explodes?.filter((x) => x.id !== id);
+    if (kind === 'position') data.positions = data.positions?.filter((x) => x.id !== id);
+  });
+}
+
+export const setExtraSuppressed = (kind: 'pattern' | 'replicate', id: string, suppressed: boolean) => change((data) => {
+  const list = kind === 'pattern' ? data.patterns : data.replicates;
+  const x = list?.find((y) => y.id === id);
+  if (x) x.suppressed = suppressed;
+});
+
+/** Shows an exploded view part of the way, or puts everything back with null. */
+export function showExplode(id: string | null, amount = 1) {
+  setShownExplode(id ? { id, amount } : null);
+  rebake();
+}
+
+/** Keeps where every instance is now, under a name. */
+export function savePosition() {
+  change((data) => {
+    const list = (data.positions ??= []);
+    list.push({ id: `n${data.next++}`, name: nextName(list, 'Position'), poses: Object.fromEntries(data.instances.map((i) => [i.id, i.pose])) });
+  });
+}
+
+/** Takes the instances back to a named position, as far as the mates let them: the solve starts from there. */
+export function goToPosition(id: string) {
+  const pos = asm().positions?.find((x) => x.id === id);
+  if (!pos) return;
+  change((data) => {
+    for (const i of data.instances) {
+      const p = pos.poses[i.id];
+      if (p) i.pose = p;
+    }
+  });
+}
+
+export const renameExtra = (kind: 'pattern' | 'replicate' | 'explode' | 'position', id: string, name: string) => change((data) => {
+  const list = { pattern: data.patterns, replicate: data.replicates, explode: data.explodes, position: data.positions }[kind] as { id: string; name: string }[] | undefined;
+  const x = list?.find((y) => y.id === id);
+  if (x && name.trim()) x.name = name.trim();
+});

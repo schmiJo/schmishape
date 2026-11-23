@@ -3,9 +3,10 @@ import { createStore, reconcile } from 'solid-js/store';
 import { wholeSketch, type RegionPick } from '../sketch/regions';
 import { doc, documentText, holdBar, insertPosition, isHidden, isSketchFeature, mutate, nextName, pushUndo, returnBar, setDoc, setRollback, sketchRegions, snapshotAt, tidyError, ToolError, type EdgeInfo, type FaceInfo, type HeldBar } from '../store/doc';
 import type { MeshData } from '../engine/client';
-import { selectedFeature, selectedRegions, selection, setSelectedRegions, setSelection, setSelectedFeature, toast } from '../store/ui';
+import { selectedFeature, selectedGeometry, selectedRegions, selection, setSelectedRegions, setSelection, setSelectedFeature, toast } from '../store/ui';
 import { view } from '../viewport/instance';
-import { defById, defForFeature, PICK_KINDS, regionsChosen, setHasBase, type FeatureDef, type FieldDef, type FieldKind, type Section, type Values } from './defs';
+import { defById, defForFeature, isSketchPath, setModelBefore, PICK_KINDS, regionsChosen, setHasBase, SINGLE_KINDS, type FeatureDef, type FieldDef, type FieldKind, type Section, type Values } from './defs';
+import { FEATURE_QUAD, isPlaneFeature, refOfQuad } from '../store/planes';
 
 export const [activeDef, setActiveDef] = createSignal<FeatureDef | null>(null);
 export const [values, setValues] = createStore<Values>({});
@@ -25,6 +26,10 @@ export interface PickBase { faces: FaceInfo[]; edges: EdgeInfo[]; mesh: MeshData
 export const [pickBase, setPickBase] = createSignal<PickBase | null>(null);
 /** The model before the feature in a dialog that takes regions, drawn solid under its see-through preview. */
 export const [previewBase, setPreviewBase] = createSignal<MeshData | null>(null);
+setModelBefore(() => {
+  const b = pickBase();
+  return b ? { faces: b.faces, parts: b.mesh.parts } : null;
+});
 
 let featureId: number | null = null;
 /** What was selected when the dialog opened, for Cancel to put back. */
@@ -41,7 +46,7 @@ let touched = false;
 const shown = (f: FieldDef) => !f.when || f.when(values);
 const pickFields = (def: FeatureDef) => def.fields.filter((f) => PICK_KINDS.has(f.kind));
 /** Picks from the model before the feature, rather than from sketches. */
-const MODEL_KINDS = new Set<FieldKind>(['edges', 'faces', 'face', 'part', 'parts', 'vertex']);
+const MODEL_KINDS = new Set<FieldKind>(['edges', 'faces', 'face', 'part', 'parts', 'vertex', 'features', 'plane', 'planes', 'point', 'points', 'line', 'edge']);
 const takesModelPicks = (def: FeatureDef) => def.fields.some((f) => MODEL_KINDS.has(f.kind));
 
 const activeField = () => {
@@ -52,6 +57,13 @@ const activeField = () => {
 /** What a click in the view picks just now. */
 export const pickKind = () => activeField()?.kind ?? null;
 export const pickKey = () => activeField()?.key ?? null;
+/** The field taking clicks, whole, for what it allows beyond its kind. */
+export const pickField = () => activeField();
+/** Whether the box taking clicks takes planes: one that takes a plane, or a face that a plane can stand in for. */
+export const pickTakesPlanes = () => {
+  const f = activeField();
+  return !!f && (f.kind === 'plane' || f.kind === 'planes' || (f.kind === 'face' && !!f.takesPlanes));
+};
 
 const isEmpty = (v: unknown) => v === null || v === undefined || (Array.isArray(v) && v.length === 0);
 
@@ -93,6 +105,9 @@ export function regionPicksShown(): RegionPick[] {
 }
 /** What the feature still needs before it can be added, if anything. */
 export const dialogMissing = () => activeDef()?.missing?.(values) ?? null;
+/** The feature the dialog is making or changing, once its preview has put it in the history. */
+const [dialogFeatureId, setDialogFeatureId] = createSignal<number | null>(null);
+export const dialogFeature = dialogFeatureId;
 /** Only what comes before this feature can be used by it. */
 export const pickLimit = () => (featureId !== null ? doc.features.findIndex((f) => f.id === featureId) : position);
 
@@ -112,6 +127,7 @@ async function applyOnce() {
     if (featureId !== null && editingId() === null) {
       await mutate('feature_delete', { id: featureId });
       featureId = null;
+      setDialogFeatureId(null);
     }
     setDialogError(null);
     return;
@@ -119,8 +135,14 @@ async function applyOnce() {
   if (featureId === null) {
     const r = await mutate('feature_add', { feature: json, name: nextName(def.namePrefix), position });
     featureId = Number(/\(id (\d+)\)/.exec(r.text)![1]);
+    setDialogFeatureId(featureId);
   } else {
-    await mutate('feature_edit', { id: featureId, feature: json });
+    // The kernel keeps a feature's parts when an edit doesn't mention them, so an edit back to all of them says so.
+    const had = doc.features.find((f) => f.id === featureId);
+    const all = Array.isArray(had?.bodies) && had.bodies.length > 0 && !('bodies' in json);
+    // The same goes for app data a dialog writes all of, such as a plane's display size turned off again.
+    const app = def.ownsApp && had?.app && Object.keys(had.app).length > 0 && !('app' in json);
+    await mutate('feature_edit', { id: featureId, feature: { ...json, ...(all ? { bodies: [] } : {}), ...(app ? { app: {} } : {}) } });
   }
   touched = true;
   const step = doc.steps.find((s) => s.id === featureId);
@@ -178,6 +200,7 @@ function close() {
     view.renderer.invalidate();
   }
   featureId = null;
+  setDialogFeatureId(null);
   lastShown = new Set();
   setSelection({ faces: [], edges: [] });
   setSelectedRegions(null);
@@ -188,10 +211,11 @@ export function applyPickMask() {
   const r = view.renderer;
   if (!r || !activeDef()) return;
   const kind = pickKind();
-  const faces = kind === 'faces' || kind === 'face' || kind === 'part' || kind === 'parts';
-  const edges = kind === 'edges' || kind === 'vertex';
+  // A point is found near the face or edge under the pointer, and a line can be the axis of a round face.
+  const faces = kind === 'faces' || kind === 'face' || kind === 'part' || kind === 'parts' || kind === 'features' || kind === 'plane' || kind === 'planes' || kind === 'point' || kind === 'points' || kind === 'line';
+  const edges = kind === 'edges' || kind === 'vertex' || kind === 'point' || kind === 'points' || kind === 'line' || kind === 'edge' || kind === 'path';
   // Extrude's box takes a part's flat faces as well as regions, as Onshape's does.
-  r.pickMask = { faces: faces || (kind === 'regions' && regionsTakeFaces() && !!pickBase()), edges, planes: false, regions: kind === 'regions' || kind === 'sections' };
+  r.pickMask = { faces: faces || (kind === 'regions' && regionsTakeFaces() && !!pickBase()), edges, planes: pickTakesPlanes(), regions: kind === 'regions' || kind === 'sections' };
   r.regionsOnTop = takesRegions();
   r.invalidate();
 }
@@ -212,6 +236,7 @@ export async function openDialog(defId: string, editId: number | null = null, pr
   touched = false;
   setHasLaterFeatures(doc.features.slice(existing ? position + 1 : position).some((f) => !isHidden(f)));
   featureId = editId;
+  setDialogFeatureId(editId);
   setEditingId(editId);
   setDialogName(existing?.name ?? nextName(def.namePrefix));
   setDialogError(null);
@@ -225,16 +250,19 @@ export async function openDialog(defId: string, editId: number | null = null, pr
   lastShown = new Set(pickFields(def).filter(shown).map((f) => f.key));
   // With its regions already there, as when a sketch was selected first, a revolve wants its axis next, as Onshape's does.
   const axis = def.fields.find((f) => f.kind === 'axis');
-  setActivePick(axis && !existing && regionsChosen(initial) ? axis.key : pickFields(def).find(shown)?.key ?? null);
+  // Otherwise the first box with nothing in it, as a draft's faces come before its neutral plane, which starts as Top.
+  const boxes = pickFields(def).filter(shown);
+  const first = (existing ? null : boxes.find((f) => f.key === def.startPick) ?? boxes.find((f) => isEmpty(initial[f.key]))) ?? boxes[0];
+  setActivePick(axis && !existing && regionsChosen(initial) ? axis.key : first?.key ?? null);
   applyPickMask();
   // As in Onshape, editing shows the model as it stood when this feature was made, with everything after it gone.
   if (existing) await setRollback(position);
-  if ((regionField(def) || takesModelPicks(def)) && position > 0) {
+  if ((regionField(def) || takesModelPicks(def) || def.needsModel) && position > 0) {
     const snap = await snapshotAt(position - 1);
     if (activeDef() !== def) return;
     if (regionField(def)) setPreviewBase(snap.mesh);
-    if (takesModelPicks(def)) {
-      view.renderer?.setPickMesh(snap.mesh);
+    if (takesModelPicks(def)) view.renderer?.setPickMesh(snap.mesh);
+    if (takesModelPicks(def) || def.needsModel) {
       setPickBase({ faces: snap.faces, edges: snap.edges, mesh: snap.mesh });
       applyPickMask();
     }
@@ -245,8 +273,134 @@ export async function openDialog(defId: string, editId: number | null = null, pr
 /** The body a face of the model before the feature belongs to. */
 export const partOfFace = (base: PickBase, face: number) => base.mesh.parts.find((p) => p.faces.includes(face))?.name ?? null;
 
+/** Whether a feature can be picked for a mirror or pattern to copy: one before it that isn't a sketch. */
+export function featurePickable(id: number) {
+  const at = doc.features.findIndex((f) => f.id === id);
+  return at >= 0 && at < pickLimit() && !isSketchFeature(doc.features[at]);
+}
+/** The feature that made a face, from its name, which starts with that feature's: f3:side.0 was made by feature 3. */
+export function featureOfFace(base: PickBase, face: number): number | null {
+  const m = /^f(\d+)[:.]/.exec(base.faces[face]?.name ?? '');
+  const id = m ? Number(m[1]) : null;
+  return id !== null && featurePickable(id) ? id : null;
+}
+/** The features the box taking clicks has picked, for the list to light them. */
+export const featurePicks = (): number[] => (pickKind() === 'features' ? (values[pickKey()!] ?? []) : []);
+/** A feature clicked in the list, or by a face it made: in it goes, or out if it was in. They're kept in history order. */
+export function pickFeature(id: number) {
+  const key = pickKey();
+  if (!key || pickKind() !== 'features' || !featurePickable(id)) return;
+  const now: number[] = [...(values[key] ?? [])];
+  const next = now.includes(id) ? now.filter((x) => x !== id) : [...now, id];
+  const order = (x: number) => doc.features.findIndex((f) => f.id === x);
+  setValue(key, next.sort((a, b) => order(a) - order(b)));
+}
+
+/**
+ * Whether a plane drawn in the view can be picked: Top, Front and Right always, and a plane feature that comes before
+ * this one. The plane being made is drawn too, but can't be made from itself.
+ */
+export function quadPickable(quad: number) {
+  if (quad < FEATURE_QUAD) return true;
+  const at = doc.features.findIndex((f) => f.id === quad - FEATURE_QUAD);
+  return at >= 0 && at < pickLimit() && isPlaneFeature(doc.features[at]);
+}
+
+/** Whether a reference is in the box taking clicks. */
+export function refPicked(ref: unknown) {
+  const key = pickKey();
+  if (!key) return false;
+  const v = values[key];
+  const c = canonical(ref);
+  return Array.isArray(v) ? v.some((x) => canonical(x) === c) : v !== null && v !== undefined && canonical(v) === c;
+}
+
+/**
+ * A plane, point, line or edge clicked for the box taking clicks. One that holds one thing takes it in place of what
+ * it had, or lets it go if it's clicked again. A list adds it, or drops it if it's in, and stops at as many as it takes.
+ * Says whether it went in.
+ */
+export function pickRef(ref: unknown): boolean {
+  const field = activeField();
+  if (!field || ref === null || ref === undefined) return false;
+  const key = field.key;
+  if (field.kind === 'path') return pickPath(key, ref);
+  const c = canonical(ref);
+  if (SINGLE_KINDS.has(field.kind)) {
+    const again = values[key] !== null && values[key] !== undefined && canonical(values[key]) === c;
+    setValue(key, again ? null : JSON.parse(c));
+    if (!again) moveOn(field);
+    return true;
+  }
+  const list: unknown[] = JSON.parse(JSON.stringify(values[key] ?? []));
+  const at = list.findIndex((x) => canonical(x) === c);
+  if (at >= 0) list.splice(at, 1);
+  else if (field.max && list.length >= field.max) return false;
+  else list.push(JSON.parse(c));
+  setValue(key, list);
+  if (field.max && list.length === field.max) moveOn(field);
+  return true;
+}
+
+/**
+ * A sweep path, as Onshape's takes it: a click on a sketch's curve takes all of that sketch's curves, end to end, and
+ * clicks on a part's edges add them up. It's one or the other, so a sketch replaces edges and edges replace a sketch.
+ */
+function pickPath(key: string, ref: unknown): boolean {
+  const list: unknown[] = JSON.parse(JSON.stringify(values[key] ?? []));
+  if (ref && typeof ref === 'object' && typeof (ref as any).sketch === 'number') {
+    const sketch = (ref as any).sketch as number;
+    const again = list.length === 1 && isSketchPath(list[0]) && list[0].sketch === sketch;
+    setValue(key, again ? [] : [{ sketch }]);
+    return true;
+  }
+  const edges = list.filter((x) => !isSketchPath(x));
+  const c = canonical(ref);
+  const at = edges.findIndex((x) => canonical(x) === c);
+  if (at >= 0) edges.splice(at, 1);
+  else edges.push(JSON.parse(c));
+  setValue(key, edges);
+  return true;
+}
+
+/** A box that has all it takes hands the clicks to the next empty one after it, as a point normal's point to its line. */
+function moveOn(field: FieldDef) {
+  const def = activeDef();
+  if (!def) return;
+  const boxes = pickFields(def).filter(shown);
+  const next = boxes.slice(boxes.indexOf(field) + 1).find((f) => isEmpty(values[f.key]));
+  if (next) activatePick(next.key);
+}
+
+/** A plane drawn in the view, as the kernel names it, for a box that takes planes. */
+export const refOfPlaneQuad = (quad: number) => (quadPickable(quad) ? refOfQuad(quad) : null);
+
+/** Whether two faces lie in one surface: one plane, or one cylinder, cone or sphere about one axis. */
+function oneSurface(a: FaceInfo, b: FaceInfo) {
+  if (a.surface !== b.surface) return false;
+  const dot = (u: number[], v: number[]) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+  const sub = (u: number[], v: number[]) => [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+  if (a.surface === 'plane') return dot(a.normal, b.normal) > 1 - 1e-9 && Math.abs(dot(sub(a.center, b.center), a.normal)) < 1e-6;
+  if (!a.axis || !b.axis || Math.abs((a.radius ?? 0) - (b.radius ?? 0)) > 1e-6) return false;
+  const d = a.axis.direction, len = Math.hypot(d[0], d[1], d[2]) || 1;
+  const off = sub(b.axis.point, a.axis.point);
+  const along = dot(off, d) / len;
+  return Math.abs(Math.abs(dot(d, b.axis.direction)) / len / (Math.hypot(...b.axis.direction) || 1) - 1) < 1e-9 && Math.hypot(...off) ** 2 - along ** 2 < 1e-10;
+}
+
+/**
+ * A face named for what lies in its surface, a plane or an axis, rather than for the face itself: its name, even when
+ * that covers several pieces, as long as they all lie in one surface, which the kernel takes as one. A key only when
+ * the name covers faces in different places, such as a pattern's copies.
+ */
+export function surfaceRef(base: PickBase, i: number) {
+  const f = base.faces[i];
+  if (!f) return null;
+  return base.faces.every((x) => x.name !== f.name || oneSurface(x, f)) ? f.name : f.key;
+}
+
 /** How a face is named for the kernel: by its name if nothing else has it, and otherwise by its own key. */
-function faceRef(base: PickBase, i: number) {
+export function faceRef(base: PickBase, i: number) {
   const f = base.faces[i];
   if (!f) return null;
   return base.faces.filter((x) => x.name === f.name).length === 1 ? f.name : f.key;
@@ -371,8 +525,13 @@ export function togglePick(hit: { kind: string; id: number }, end: 'start' | 'en
     const name = base.faces[hit.id]?.name;
     if (name) setValue(key, toggled([...(values[key] ?? [])], name));
   } else if (hit.kind === 'face' && kind === 'face') {
-    const ref = faceRef(base, hit.id);
+    const ref = activeField()?.surface ? surfaceRef(base, hit.id) : faceRef(base, hit.id);
     if (ref) setValue(key, values[key] === ref ? null : ref);
+  } else if (hit.kind === 'plane' && kind === 'face' && pickTakesPlanes()) {
+    pickRef(refOfPlaneQuad(hit.id));
+  } else if (hit.kind === 'face' && kind === 'features') {
+    const id = featureOfFace(base, hit.id);
+    if (id !== null) pickFeature(id);
   } else if (hit.kind === 'face' && (kind === 'part' || kind === 'parts')) {
     const part = partOfFace(base, hit.id);
     if (!part) return;
@@ -415,6 +574,14 @@ export function addPicks(found: { faces: number[]; edges: number[] }) {
       if (ref) refs.add(ref);
     }
     if (refs.size !== (values.faces ?? []).length) setValue('faces', [...refs]);
+  } else if (kind === 'features') {
+    const ids = new Set<number>(values[key] ?? []);
+    for (const i of found.faces) {
+      const id = featureOfFace(base, i);
+      if (id !== null) ids.add(id);
+    }
+    const order = (x: number) => doc.features.findIndex((f) => f.id === x);
+    setValue(key, [...ids].sort((a, b) => order(a) - order(b)));
   } else if (kind === 'parts') {
     const names = new Set<string>(values[key] ?? []);
     for (const i of found.faces) {
@@ -479,10 +646,25 @@ export async function startFeature(defId: string) {
   const def = defById(defId);
   if (!def) return;
   const sel = selection();
+  // A sketch selected first, in the list or by a region of it, is what a feature that takes a sketch takes.
+  const picked = doc.features.find((f) => f.id === selectedFeature());
+  const chosenSketch = picked && isSketchFeature(picked) ? (picked.id as number) : selectedRegions()?.sketch ?? null;
   await openDialog(defId, null, regionField(def) ? regionsFromSelection() : undefined);
+  const sketchField = def.fields.find((f) => f.kind === 'sketch');
+  if (sketchField && chosenSketch !== null && activeDef()) setValue(sketchField.key, chosenSketch);
   const base = pickBase();
   const field = activeField();
-  if (!field || !base || !activeDef()) return;
+  if (!field || !activeDef()) return;
+  // A plane or flat face selected first is what a plane is made from, as in Onshape.
+  if (field.kind === 'plane' || field.kind === 'planes') {
+    const g = selectedGeometry();
+    const chosen = doc.features.find((f) => f.id === selectedFeature());
+    const refs: unknown[] = typeof g === 'number' ? [refOfQuad(g)]
+      : chosen && isPlaneFeature(chosen) && quadPickable(FEATURE_QUAD + chosen.id) ? [chosen.id]
+      : base ? sel.faces.filter((i) => flatFace(base, i)).map((i) => surfaceRef(base, i)) : [];
+    for (const ref of refs.slice(0, field.max ?? 1)) pickRef(ref);
+  }
+  if (!base) return;
   // A flat face selected first is what the extrude takes, as when you select a face in Onshape and press Extrude.
   if (field.kind === 'regions' && sel.faces.length) {
     const refs = [...new Set(sel.faces.filter((i) => flatFace(base, i)).map((i) => faceRef(base, i)).filter((x): x is string => !!x))];

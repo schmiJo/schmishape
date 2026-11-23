@@ -11,14 +11,14 @@ import { clearSelection, mode, setHiddenParts, setMode, toast } from './ui';
  * A document's tabs, as in Onshape. The kernel holds one document at a time, so each Part Studio is its own kernel
  * document, and switching tabs puts the one you left away and opens the other.
  */
-export type TabKind = 'part-studio' | 'assembly' | 'folder';
+export type TabKind = 'part-studio' | 'assembly' | 'drawing' | 'folder';
 export interface Tab { id: string; kind: TabKind; name: string; parent: string | null }
 
 const TABS_KEY = 'schmishape.tabs';
 const LEGACY_DOC_KEY = 'schmishape.document';
 const MANAGER_KEY = 'schmishape.tab-manager';
 const docKey = (id: string) => `schmishape.document.${id}`;
-const BASE_NAME: Record<TabKind, string> = { 'part-studio': 'Part Studio', assembly: 'Assembly', folder: 'Folder' };
+const BASE_NAME: Record<TabKind, string> = { 'part-studio': 'Part Studio', assembly: 'Assembly', drawing: 'Drawing', folder: 'Folder' };
 
 export const [tabs, setTabs] = createSignal<Tab[]>([]);
 export const [activeTabId, setActiveTabId] = createSignal('');
@@ -30,6 +30,9 @@ export const [tabManagerOpen, setTabManagerShown] = createSignal(storage.get(MAN
 export const tabById = (id: string | null) => tabs().find((t) => t.id === id);
 export const activeTab = () => tabById(activeTabId());
 export const inAssembly = () => activeTab()?.kind === 'assembly';
+export const inDrawing = () => activeTab()?.kind === 'drawing';
+/** Not a Part Studio: an assembly or a drawing, where modelling tools have nothing to act on. */
+export const notStudio = () => inAssembly() || inDrawing();
 export const childrenOf = (parent: string | null) => tabs().filter((t) => t.parent === parent);
 export const iconForTab = (t: Tab) => t.kind;
 
@@ -47,6 +50,9 @@ export function isInside(id: string, folder: string) {
 }
 
 let nextId = 1;
+let lastStudio = '';
+/** The Part Studio open last, for a new drawing to show. */
+export const lastStudioTab = () => lastStudio;
 const save = () => storage.set(TABS_KEY, JSON.stringify({ tabs: tabs(), active: activeTabId(), next: nextId }));
 
 export function toggleTabManager() {
@@ -63,6 +69,18 @@ export const assemblyHooks = {
   take: (_tab: string): string | null => null,
   put: (_tab: string, _text: string | null) => {},
 };
+
+/** The same for a Drawing tab, filled in by the drawing code. `enter` can be given what a new drawing shows. */
+export const drawingHooks = {
+  enter: async (_tab: string) => {},
+  leave: () => {},
+  copy: (_from: string, _to: string) => {},
+  take: (_tab: string): string | null => null,
+  put: (_tab: string, _text: string | null) => {},
+  /** A new drawing's first contents, of a Part Studio and maybe one of its parts. */
+  create: (_tab: string, _source: { tab: string; body?: string | null }) => {},
+};
+const hooksFor = (kind: TabKind | undefined) => (kind === 'assembly' ? assemblyHooks : kind === 'drawing' ? drawingHooks : null);
 
 interface Camera { target: V3; rot: Quat; halfH: number }
 /** What a tab was doing when you left it. Undo and the view last until the page closes, the document for good. */
@@ -106,9 +124,10 @@ async function switchTo(id: string, opened?: string) {
   await cancelDialog();
   if (mode() === 'pick-plane') setMode('part');
   await serial(async () => {});
-  if (inAssembly()) assemblyHooks.leave();
+  hooksFor(activeTab()?.kind)?.leave();
   flushAutosave();
   const left = activeTabId();
+  if (tabById(left)?.kind === 'part-studio') lastStudio = left;
   const cam = view.renderer?.camera;
   if (tabById(left)) memory.set(left, { doc: rememberDoc(), camera: cam && { target: [...cam.target], rot: [...cam.rot] as Quat, halfH: cam.halfH } });
   setActiveTabId(id);
@@ -130,8 +149,8 @@ async function switchTo(id: string, opened?: string) {
       await showDoc({ text: null, rollback: null, undo: [], redo: [] });
     }
   }
-  if (t.kind === 'assembly') await assemblyHooks.enter(id);
-  if (cam) {
+  await hooksFor(t.kind)?.enter(id);
+  if (cam && t.kind !== 'drawing') {
     const saved = memory.get(id)?.camera;
     const m = mesh();
     if (saved && opened === undefined) cam.animateTo(saved, 0);
@@ -158,6 +177,15 @@ export function createTab(kind: TabKind) {
     const t = addTab(kind);
     if (kind === 'folder') setRenamingTab(t.id);
     else await switchTo(t.id);
+  });
+}
+
+/** A new Drawing of a Part Studio, or of one of its parts, opened beside the tab it's made from. */
+export function createDrawing(source: { tab: string; body?: string | null }, name?: string) {
+  return inTurn(async () => {
+    const t = addTab('drawing', name);
+    drawingHooks.create(t.id, source);
+    await switchTo(t.id);
   });
 }
 
@@ -206,7 +234,7 @@ export function duplicateTab(id: string) {
     const text = id === activeTabId() ? documentText() : docOf(id).text;
     const copy = addTab(t.kind, `Copy of ${t.name}`, t);
     copyPlaces(id, copy.id);
-    if (t.kind === 'assembly') assemblyHooks.copy(id, copy.id);
+    hooksFor(t.kind)?.copy(id, copy.id);
     await switchTo(copy.id, t.kind === 'part-studio' && text ? text : undefined);
   });
 }
@@ -226,7 +254,7 @@ export function deleteTab(id: string) {
     const at = tabs().indexOf(t);
     const kept = memory.get(id) ?? { doc: docOf(id) };
     const places = readPlaces(id);
-    const assembly = t.kind === 'assembly' ? assemblyHooks.take(id) : null;
+    const hooked = hooksFor(t.kind)?.take(id) ?? null;
     memory.delete(id);
     storage.remove(docKey(id));
     dropPlaces(id);
@@ -241,7 +269,7 @@ export function deleteTab(id: string) {
         memory.set(id, kept);
         if (t.kind === 'part-studio' && kept.doc.text) storage.set(docKey(id), kept.doc.text);
         restorePlaces(id, places);
-        assemblyHooks.put(id, assembly);
+        hooksFor(t.kind)?.put(id, hooked);
         await switchTo(id);
       }),
     });
@@ -319,5 +347,5 @@ export async function bootTabs() {
   setAutosaveKey(t.kind === 'part-studio' ? docKey(t.id) : null);
   setPlacesScope(t.id);
   await boot();
-  if (t.kind === 'assembly') await assemblyHooks.enter(t.id);
+  await hooksFor(t.kind)?.enter(t.id);
 }

@@ -12,6 +12,7 @@ interface Exports {
   sx_env(): number;
   sx_mesh(upto: number, draft: number): number;
   sx_stl(): number;
+  sx_drawing(p: number, n: number): number;
 }
 
 const dec = new TextDecoder();
@@ -25,7 +26,11 @@ function start() {
   const instance = new WebAssembly.Instance(compiled, {
     env: {
       sx_on_panic(p: number, n: number) {
-        panic = dec.decode(new Uint8Array(x.memory.buffer, p, n));
+        panic = text(p, n);
+      },
+      // Sent while the call is still running: the page is free to show it, the worker isn't.
+      sx_progress(p: number, n: number) {
+        self.postMessage({ progress: text(p, n) });
       },
     },
   });
@@ -33,19 +38,22 @@ function start() {
   x.sx_init();
 }
 
-const text = (p: number, n: number) => dec.decode(new Uint8Array(x.memory.buffer, p, n));
+// Wasm hands back addresses as signed 32-bit numbers, so past 2 GB of memory, as a large STEP import takes, they
+// come out negative. `>>> 0` reads them as the unsigned addresses they are.
+const at = (p: number) => p >>> 0;
+const text = (p: number, n: number) => dec.decode(new Uint8Array(x.memory.buffer, at(p), at(n)));
 
-function call(message: string): string {
+function call(message: string, fn: (p: number, n: number) => number = x.sx_call): string {
   const bytes = enc.encode(message);
-  const p = x.sx_alloc(bytes.length);
+  const p = at(x.sx_alloc(bytes.length));
   new Uint8Array(x.memory.buffer, p, bytes.length).set(bytes);
-  const r = x.sx_call(p, bytes.length);
+  const r = fn(p, bytes.length);
   return text(r, x.sx_out_len());
 }
 
 function mesh(upto: number, draft: boolean) {
   // Call first: meshing can grow memory, which detaches any view or buffer taken before it.
-  const table = x.sx_mesh(upto, draft ? 1 : 0);
+  const table = at(x.sx_mesh(upto, draft ? 1 : 0));
   const buf = x.memory.buffer;
   const t = new Uint32Array(buf, table, 14).slice();
   const out = {
@@ -72,6 +80,9 @@ self.onmessage = (e: MessageEvent) => {
         (self as unknown as Worker).postMessage({ id, ok: true, result: m.out }, m.transfer as Transferable[]);
         break;
       }
+      case 'drawing':
+        self.postMessage({ id, ok: true, result: call(message, x.sx_drawing) });
+        break;
       case 'env':
         self.postMessage({ id, ok: true, result: text(x.sx_env(), x.sx_out_len()) });
         break;
@@ -79,8 +90,8 @@ self.onmessage = (e: MessageEvent) => {
         self.postMessage({ id, ok: true, result: text(x.sx_tools(), x.sx_out_len()) });
         break;
       case 'stl': {
-        const p = x.sx_stl();
-        const bytes = new Uint8Array(x.memory.buffer, p, x.sx_out_len()).slice();
+        const p = at(x.sx_stl());
+        const bytes = new Uint8Array(x.memory.buffer, p, at(x.sx_out_len())).slice();
         (self as unknown as Worker).postMessage({ id, ok: true, result: bytes }, [bytes.buffer] as Transferable[]);
         break;
       }

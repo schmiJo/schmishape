@@ -87,7 +87,11 @@ const AXES: { label: string; dir: V3; color: string }[] = [
   { label: 'Y', dir: [0, 1, 0], color: '#2B9A4C' },
   { label: 'Z', dir: [0, 0, 1], color: '#3566D6' },
 ];
-const VIEW_ITEMS = ['view.iso', 'view.top', 'view.front', 'view.right', 'view.back', 'view.left', 'view.bottom', 'fit'];
+const VIEW_ITEMS: (string | null)[] = [
+  'view.iso', 'view.top', 'view.front', 'view.right', 'view.back', 'view.left', 'view.bottom', 'fit', null,
+  'display.shaded', 'display.no-edges', 'display.hidden-edges', 'display.hidden-removed', 'display.translucent', 'display.wireframe', null,
+  'view.section',
+];
 
 function inPolygon(x: number, y: number, pts: [number, number][]) {
   let sign = 0;
@@ -358,7 +362,7 @@ export function ViewCube(props: { onEnter?: () => void }) {
         data-testid="view-menu"
         onClick={() => {
           const b = menuButton.getBoundingClientRect();
-          setMenuAt(menuAt() ? null : { x: b.right - 190, y: b.bottom + 4 });
+          setMenuAt(menuAt() ? null : { x: b.right - 210, y: b.bottom + 4 });
         }}
       >
         <Icon name="iso" size={15} />
@@ -369,12 +373,16 @@ export function ViewCube(props: { onEnter?: () => void }) {
           <>
             <div class="menu-scrim" onPointerDown={() => setMenuAt(null)} />
             <div class="menu" role="menu" style={{ left: `${at().x}px`, top: `${at().y}px` }}>
-              <For each={VIEW_ITEMS.map(command)}>
+              <For each={VIEW_ITEMS.map((id) => (id ? command(id) : null))}>
                 {(c) => (
-                  <button role="menuitem" onClick={() => { setMenuAt(null); void c.run(); }} data-command={c.id}>
-                    {c.title}
-                    <Show when={c.keys}><kbd>{c.keys}</kbd></Show>
-                  </button>
+                  <Show when={c} fallback={<div class="menu-rule" role="separator" />}>
+                    {(c) => (
+                      <button role={c().checked ? 'menuitemradio' : 'menuitem'} aria-checked={c().checked ? c().checked!() : undefined} disabled={c().enabled ? !c().enabled!() : false} onClick={() => { setMenuAt(null); void c().run(); }} data-command={c().id}>
+                        <span class="menu-label"><span class="menu-check">{c().checked?.() ? '✓' : ''}</span>{c().title}</span>
+                        <Show when={c().keys}><kbd>{c().keys}</kbd></Show>
+                      </button>
+                    )}
+                  </Show>
                 )}
               </For>
             </div>

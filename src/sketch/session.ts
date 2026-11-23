@@ -5,9 +5,13 @@ import { snapsOn, toast } from '../store/ui';
 import type { Camera } from '../viewport/camera';
 import { bareExpression, defaultPlace, dimValueText, fmt, layoutDimension, SIGNED } from './dimension';
 import { cornerOf, isPartCorner, isPartEdge, isPartRef, partIndex, type PartGeometry } from './parts';
-import { arcPoints, ccw, circleThrough, crossings, angleOf, closestOnEntity, dist2, drawn, isProjected, pointsOf, polyline, toLocal, toWorld, type Con, type Ent, type Plane, type SketchData, type V2 } from './geometry';
+import { textOutlinesOf, type SketchText } from './text';
+import { arcPoints, ccw, circleThrough, crossings, angleOf, closestOnEntity, dist2, drawn, isProjected, pointsOf, polyline, segPoints, toLocal, toWorld, type Con, type Ent, type Plane, type SketchData, type V2 } from './geometry';
+import { applyTies, conHidden, noLinks, tidyLinks, type SketchLinks } from './links';
+import { chainsOf, offsetAt, offsetBuild, offsetChain, type Built, type Chain } from './offset';
+import { patternable, patternBuild, patternPreview, type PatternSetup } from './pattern';
 
-export type Tool = 'select' | 'line' | 'rect' | 'rect-center' | 'circle' | 'circle-3pt' | 'arc' | 'arc-center' | 'arc-tangent' | 'spline' | 'point' | 'trim' | 'sketch-fillet' | 'dimension';
+export type Tool = 'select' | 'line' | 'rect' | 'rect-center' | 'circle' | 'circle-3pt' | 'arc' | 'arc-center' | 'arc-tangent' | 'slot' | 'polygon' | 'spline' | 'point' | 'trim' | 'extend' | 'sketch-fillet' | 'offset' | 'mirror' | 'sketch-linear' | 'sketch-circular' | 'dimension' | 'text';
 
 export interface Snap {
   p: V2;
@@ -40,17 +44,22 @@ type Draft =
   | { kind: 'rect-center'; c: V2; snap: Snap; pressed: [number, number] | null }
   | { kind: 'arc'; a: V2; snap: Snap; b?: V2; bSnap?: Snap }
   | { kind: 'arc-center'; c: V2; snap: Snap; s?: V2; sSnap?: Snap }
+  | { kind: 'slot'; a: V2; snap: Snap; b?: V2; bSnap?: Snap }
+  | { kind: 'polygon'; c: V2; snap: Snap }
   | { kind: 'spline'; pts: V2[]; snaps: Snap[] }
   | { kind: 'circle-3pt'; pts: V2[]; snaps: Snap[] }
   | { kind: 'arc-tangent'; start: V2; ref: string; off: Ent; tangent: V2 }
   | { kind: 'dim'; first: string; second?: string; pressed: [number, number] | null }
   | { kind: 'dimdrag'; id: number; press: [number, number]; moved: boolean; editOnClick: boolean }
   | { kind: 'drag'; grab: string | { edge: number }; last: V2; moved: boolean }
-  | { kind: 'box'; a: [number, number]; b: [number, number] };
+  | { kind: 'box'; a: [number, number]; b: [number, number] }
+  | { kind: 'offset'; chains: Chain[]; d: number };
 
 export interface LabelRect { key: string; x: number; y: number; w: number; h: number }
 
 const POINT_HIT = 9;
+/** What was copied in a sketch, kept while the app is open so it can go into another sketch. */
+let sketchClipboard: { ents: Ent[]; cons: Con[]; texts: SketchText[]; middle?: V2 } | null = null;
 /** How many picks a constraint tool takes before it knows they can't make that constraint. */
 const CONSTRAINT_PICKS: Record<string, number> = { symmetric: 3, fix: 1 };
 /** What each constraint tool takes, for when the picks don't fit. */
@@ -74,6 +83,12 @@ export const conIdOf = (s: string) => Number(s.slice(1));
 export const isPointRef = (s: string) => s === 'origin' || s.includes('.');
 export { fmt };
 
+/** A height that reads as a number: 1, 2 or 5 times a power of ten. */
+function niceHeight(h: number) {
+  const p = 10 ** Math.floor(Math.log10(h));
+  return [1, 2, 5, 10].map((k) => k * p).find((x) => x >= h * 0.7) ?? 10 * p;
+}
+
 export class SketchSession {
   data: SketchData;
   regions: any[] = [];
@@ -84,11 +99,20 @@ export class SketchSession {
   labels: LabelRect[] = [];
 
   readonly tool = createSignal<Tool>('line');
+  /** The line the mirror tool mirrors about, once it's been clicked, and what was selected when the tool was taken up. */
+  readonly mirrorLine = createSignal<number | null>(null);
+  private mirrorPending: number[] = [];
+  /** How many sides the polygon tool draws, as Onshape's asks: + and − change it while drawing. */
+  readonly polygonSides = createSignal(6);
   readonly selection = createSignal<string[]>([]);
   /** A constraint tool waiting for its picks, as Onshape's wait when nothing that suits them was selected first. */
   readonly constraintTool = createSignal<string | null>(null);
   readonly analysis = createSignal<Analysis>({ dof: 0, free: [], redundant: [] });
   readonly editing = createSignal<{ id: number; x: number; y: number; text: string; fresh: boolean } | null>(null);
+  /** A text whose words are being typed, where its box sits on screen. */
+  readonly textEditing = createSignal<{ id: number; x: number; y: number; text: string; fresh: boolean } | null>(null);
+  /** Each text's outlines, by its id, as the kernel sets them in its font: what's drawn and what a click finds. */
+  textOutlines = new Map<number, V2[][]>();
   readonly canUndo = createSignal(false);
   readonly canRedo = createSignal(false);
 
@@ -117,6 +141,20 @@ export class SketchSession {
    * so only what comes before it counts.
    */
   context: { plane: unknown; position: number } | null = null;
+  /**
+   * What the file says the sketch is on, when that's more than its numbers: a plane feature, `{"on_plane": 7}`, which it
+   * then follows, or whatever an edited sketch already had. Null writes the plane as numbers.
+   */
+  placement: unknown = null;
+
+  /** What ties offsets and patterns to their originals, and what of them stays out of sight. */
+  links: SketchLinks = noLinks();
+  /** A pattern being set up: what it copies, how many and how far apart. */
+  readonly pattern = createSignal<PatternSetup | null>(null);
+  /** The curves the offset tool would take, under the pointer. */
+  offsetHover: number[] = [];
+  /** Where the extend tool would take a curve's end, under the pointer. */
+  extending: V2[] | null = null;
 
   constructor(
     public readonly featureId: number | null,
@@ -126,10 +164,12 @@ export class SketchSession {
     public readonly camera: Camera,
     private invalidate: () => void,
     places: Map<number, V2> = new Map(),
+    links: SketchLinks = noLinks(),
   ) {
     this.places = places;
+    this.links = links;
     this.data = initial;
-    this.nextEntity = Math.max(0, ...initial.entities.map((e) => e.id), (initial.next_entity ?? 1) - 1) + 1;
+    this.nextEntity = Math.max(0, ...initial.entities.map((e) => e.id), ...((initial.texts ?? []) as SketchText[]).map((t) => t.id), (initial.next_entity ?? 1) - 1) + 1;
     this.nextConstraint = Math.max(0, ...initial.constraints.map((c) => c.id), (initial.next_constraint ?? 1) - 1) + 1;
     if (featureId !== null) this.tool[1]('select');
     this.enqueue(async () => {
@@ -198,6 +238,95 @@ export class SketchSession {
   private async refreshRegions() {
     const r = await engine.call('sketch_arrangement', { sketch: this.data, ...this.where() });
     this.regions = r.ok ? JSON.parse(r.text).regions : [];
+    this.textOutlines = textOutlinesOf(this.data, this.regions);
+  }
+
+  /** The texts there are, each placed by two of the sketch's points. */
+  texts(): SketchText[] {
+    return (this.data.texts ?? []) as SketchText[];
+  }
+  textOf = (id: number) => this.texts().find((t) => t.id === id);
+
+  /** A text's box on screen, around its outlines, or its two points while it has none. */
+  textBox(t: SketchText): { x0: number; y0: number; x1: number; y1: number } | null {
+    const pts = (this.textOutlines.get(t.id) ?? []).flat();
+    for (const ref of [`${t.at}`, `${t.up}`]) {
+      const p = this.pointAt(ref);
+      if (p) pts.push(p);
+    }
+    if (!pts.length) return null;
+    const scr = pts.map((p) => this.screen(p));
+    const xs = scr.map((q) => q[0]), ys = scr.map((q) => q[1]);
+    return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+  }
+
+  /** Opens the box for typing a text's words, just under its start. */
+  openTextEditor(id: number, fresh = false) {
+    const t = this.textOf(id);
+    const at = t && this.pointAt(`${t.at}`);
+    if (!t || !at) return;
+    const [x, y] = this.screen(at);
+    this.textEditing[1]({ id, x, y: y + 6, text: t.text, fresh });
+  }
+
+  /** New words for a text. With none, the text goes, and its points with it. */
+  setText(id: number, words: string) {
+    const was = this.textEditing[0]();
+    this.textEditing[1](null);
+    const t = this.textOf(id);
+    if (!t) return;
+    if (!words.trim()) {
+      this.selection[1]([String(id)]);
+      this.deleteSelection();
+      return;
+    }
+    if (words === t.text && !was?.fresh) return;
+    void this.change((d) => {
+      const found = ((d.texts ?? []) as SketchText[]).find((x) => x.id === id);
+      if (found) found.text = words;
+    });
+  }
+
+  /** Places a text: its baseline starts at the click, a capital as tall as a few dozen pixels, upright, then the words are typed. */
+  private placeText(sx: number, sy: number) {
+    const s = this.makeSnap(sx, sy);
+    const h = niceHeight(this.camera.worldPerPixel * 28);
+    const at = this.newEnt({ type: 'point', at: [...s.p] as V2 });
+    const up = this.newEnt({ type: 'point', at: [s.p[0], s.p[1] + h] });
+    const id = this.nextEntity++;
+    const hard = [
+      { type: 'vertical', a: `${at.id}`, b: `${up.id}` },
+      { type: 'distance', a: `${at.id}`, b: `${up.id}`, value: h },
+    ].map((c) => ({ ...c, id: this.nextConstraint++ }) as Con);
+    void this.editWithHints((d) => {
+      d.entities.push(at, up);
+      d.constraints.push(...hard);
+      d.texts = [...((d.texts ?? []) as SketchText[]), { id, at: at.id, up: up.id, text: 'Text', font: 'sans' }];
+    }, this.snapCons(`${at.id}`, s)).then((ok) => {
+      if (!ok) return;
+      this.selection[1]([String(id)]);
+      this.openTextEditor(id, true);
+      this.invalidate();
+    });
+  }
+
+  /** The sketch and its links, as one step to go back to. */
+  private snapshot() {
+    return JSON.stringify({ d: this.data, l: this.links });
+  }
+  private restore(text: string) {
+    const v = JSON.parse(text);
+    this.data = v.d;
+    this.links = v.l;
+  }
+
+  /** Whether an entity is a helper, kept out of sight. */
+  hidden = (id: number) => String(id) in this.links.helpers;
+  /** Whether a constraint is kept out of sight. */
+  conHidden = (c: Con) => conHidden(this.links, c);
+  /** The entities there are to see and pick: all but the helpers. */
+  shown() {
+    return this.data.entities.filter((e) => !this.hidden(e.id));
   }
 
   private remember(before: string) {
@@ -212,6 +341,40 @@ export class SketchSession {
     this.data.next_constraint = this.nextConstraint;
   }
 
+  /**
+   * Solves with some entities held where they are, so what's tied to them moves instead. Then they're let go, and the
+   * solve after starts from there. Without it, a big change, such as a pattern's angle, can swing the originals round
+   * to meet their copies, and drag loose geometry elsewhere with them.
+   */
+  private async solveHolding(ids: number[]) {
+    const kept = this.data.constraints;
+    const fixes: Con[] = [];
+    let n = 0;
+    const fix = (what: string, at: number[]) => fixes.push({ id: 2_000_000_000 + n++, type: 'fix', what, at });
+    for (const id of ids) {
+      const e = this.data.entities.find((x) => x.id === id);
+      if (!e || isProjected(e)) continue;
+      if (e.type === 'line') fix(`${id}`, [...e.start!, ...e.end!]);
+      else if (e.type === 'circle') fix(`${id}`, [...e.center!, e.radius!]);
+      else if (e.type === 'arc') fix(`${id}`, [...e.center!, e.radius!, ...e.start!, ...e.end!]);
+      else if (e.type === 'point') fix(`${id}`, [...e.at!]);
+      else for (const { ref, p } of pointsOf(e)) fix(ref, [...p]);
+    }
+    if (!fixes.length) return;
+    this.data.constraints = [...kept, ...fixes];
+    const r = await engine.call('sketch_solve', { sketch: this.data, parameters: { ...doc.env }, ...this.where() });
+    const solved = r.ok ? (JSON.parse(r.text).sketch as SketchData) : null;
+    this.data.constraints = kept;
+    if (solved) {
+      // Only where things are comes from the held solve: the constraints stay as they were.
+      this.data.entities = solved.entities;
+      for (const c of kept) {
+        const v = solved.constraints.find((x) => x.id === c.id);
+        if (v && c.reference) c.value = v.value;
+      }
+    }
+  }
+
   /** Any part corner or edge a constraint names becomes the linked entity it means, so it follows the part. */
   private resolveLinks(d: SketchData) {
     for (const c of d.constraints) {
@@ -223,18 +386,21 @@ export class SketchSession {
   }
 
   /** A change the solver has to accept, or it's taken back with the reason. */
-  change(edit: (d: SketchData) => void, opts: { refuseRedundant?: string } = {}): Promise<boolean> {
+  change(edit: (d: SketchData) => void, opts: { refuseRedundant?: string; hold?: number[] } = {}): Promise<boolean> {
     return this.enqueue(async () => {
-      const before = JSON.stringify(this.data);
+      const before = this.snapshot();
       const redundantBefore = this.analysis[0]().redundant.length;
       const analysisBefore = this.analysis[0]();
       edit(this.data);
+      tidyLinks(this.data, this.links);
+      applyTies(this.data, this.links);
       this.resolveLinks(this.data);
       this.stampIds();
+      if (opts.hold?.length) await this.solveHolding(opts.hold);
       const res = await this.solve();
       const refuse = !res.ok ? res.message! : opts.refuseRedundant && this.analysis[0]().redundant.length > redundantBefore ? opts.refuseRedundant : null;
       if (refuse) {
-        this.data = JSON.parse(before);
+        this.restore(before);
         this.analysis[1](analysisBefore);
         toast(refuse, res.ok ? 'info' : 'error');
         this.invalidate();
@@ -251,13 +417,14 @@ export class SketchSession {
   private editWithHints(edit: (d: SketchData) => void, soft: Omit<Con, 'id'>[]) {
     const softCons = soft.map((c) => ({ ...c, id: this.nextConstraint++ }) as Con);
     return this.enqueue(async () => {
-      const before = JSON.stringify(this.data);
+      const before = this.snapshot();
       edit(this.data);
+      tidyLinks(this.data, this.links);
       this.resolveLinks(this.data);
       this.stampIds();
       const res = await this.solve();
       if (!res.ok) {
-        this.data = JSON.parse(before);
+        this.restore(before);
         toast(res.message!, 'error');
         this.invalidate();
         return false;
@@ -293,8 +460,8 @@ export class SketchSession {
     return this.enqueue(async () => {
       const prev = this.history.pop();
       if (prev === undefined) return;
-      this.future.push(JSON.stringify(this.data));
-      this.data = JSON.parse(prev);
+      this.future.push(this.snapshot());
+      this.restore(prev);
       this.canUndo[1](this.history.length > 0);
       this.canRedo[1](true);
       await this.solve();
@@ -308,8 +475,8 @@ export class SketchSession {
     return this.enqueue(async () => {
       const next = this.future.pop();
       if (next === undefined) return;
-      this.history.push(JSON.stringify(this.data));
-      this.data = JSON.parse(next);
+      this.history.push(this.snapshot());
+      this.restore(next);
       this.canUndo[1](true);
       this.canRedo[1](this.future.length > 0);
       await this.solve();
@@ -344,7 +511,7 @@ export class SketchSession {
       if (d < bestD) { bestD = d; best = { p, ref }; }
     };
     consider('origin', [0, 0]);
-    for (const e of this.data.entities) for (const { ref, p } of pointsOf(e)) consider(ref, p);
+    for (const e of this.shown()) for (const { ref, p } of pointsOf(e)) consider(ref, p);
     if (best) return best;
 
     // A part's corner, as Onshape snaps to it: what's drawn there stays on it, wherever the part goes.
@@ -356,7 +523,7 @@ export class SketchSession {
 
     // Middles of lines.
     bestD = POINT_HIT - 1;
-    for (const e of this.data.entities) {
+    for (const e of this.shown()) {
       if (e.type !== 'line' || skip(e)) continue;
       const m: V2 = [(e.start![0] + e.end![0]) / 2, (e.start![1] + e.end![1]) / 2];
       const d = away(m);
@@ -367,7 +534,7 @@ export class SketchSession {
     if (from) {
       // The point on a curve where a line from here would just touch it.
       bestD = 9;
-      for (const e of this.data.entities) {
+      for (const e of this.shown()) {
         if ((e.type !== 'circle' && e.type !== 'arc') || skip(e)) continue;
         const c = e.center!, r = e.radius!;
         const d = dist2(from, c);
@@ -385,7 +552,7 @@ export class SketchSession {
     }
 
     let edgeD = EDGE_HIT;
-    for (const e of this.data.entities) {
+    for (const e of this.shown()) {
       if (skip(e)) continue;
       const c = closestOnEntity(e, raw);
       if (!c) continue;
@@ -456,7 +623,7 @@ export class SketchSession {
     const align = 6 * px;
     let dx = align, dy = align;
     const others: { ref: string; p: V2 }[] = [{ ref: 'origin', p: [0, 0] }];
-    for (const e of this.data.entities) if (!skip(e)) others.push(...pointsOf(e));
+    for (const e of this.shown()) if (!skip(e)) others.push(...pointsOf(e));
     for (const o of others) {
       if (o.ref === ignore) continue;
       if (Math.abs(raw[0] - o.p[0]) < dx) { dx = Math.abs(raw[0] - o.p[0]); snap.p[0] = o.p[0]; snap.alignX = o.ref; }
@@ -468,7 +635,7 @@ export class SketchSession {
   /** Lines and arcs that end at a point. */
   private connectedAt(p: V2, ignore?: string): Ent[] {
     const tol = this.camera.worldPerPixel * 1.5;
-    return this.data.entities.filter((e) => {
+    return this.shown().filter((e) => {
       if (ignore?.split('.')[0] === String(e.id) || (e.type !== 'line' && e.type !== 'arc')) return false;
       return dist2(e.start!, p) < tol || dist2(e.end!, p) < tol;
     });
@@ -505,7 +672,7 @@ export class SketchSession {
       const d = Math.hypot(s[0] - sx, s[1] - sy);
       if (d < bestD) { bestD = d; best = ref; }
     };
-    for (const e of this.data.entities) for (const { ref, p } of pointsOf(e)) consider(ref, p);
+    for (const e of this.shown()) for (const { ref, p } of pointsOf(e)) consider(ref, p);
     consider('origin', [0, 0]);
     if (best) return best;
     // The sketch's own points come first, then a part's corners, then the sketch's curves, then a part's edges.
@@ -513,7 +680,7 @@ export class SketchSession {
     if (part && isPartCorner(part)) return part;
     let edgeD = EDGE_HIT;
     const raw = this.local(sx, sy);
-    for (const e of this.data.entities) {
+    for (const e of this.shown()) {
       if (e.type === 'point') continue;
       const c = closestOnEntity(e, raw);
       if (!c) continue;
@@ -522,6 +689,11 @@ export class SketchSession {
       if (d < edgeD) { edgeD = d; best = String(e.id); }
     }
     if (best) return best;
+    // A text is picked anywhere in its box, as its letters are too thin to aim at.
+    for (const t of this.texts()) {
+      const b = this.textBox(t);
+      if (b && sx >= b.x0 - 3 && sx <= b.x1 + 3 && sy >= b.y0 - 3 && sy <= b.y1 + 3) return String(t.id);
+    }
     if (part) return part;
     const k = this.camera.worldPerPixel * 5;
     if (Math.abs(raw[0]) < k) return 'y_axis';
@@ -613,6 +785,155 @@ export class SketchSession {
     );
     void this.addDrawn([...ents, across, down, center], hard, this.snapCons(`${center.id}`, d.snap));
     this.draft = null;
+  }
+
+  /** A slot's outline from its centre line and a point its side passes: two sides and two round ends, with how wide. */
+  slotShape(a: V2, b: V2, at: V2) {
+    const len = dist2(a, b);
+    if (len < 1e-9) return null;
+    const d: V2 = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+    const n: V2 = [-d[1], d[0]];
+    const r = Math.abs((at[0] - a[0]) * n[0] + (at[1] - a[1]) * n[1]);
+    if (r < 1e-9) return null;
+    const off = (p: V2, k: number): V2 => [p[0] + n[0] * r * k, p[1] + n[1] * r * k];
+    return { r, n, a1: off(a, 1), a2: off(a, -1), b1: off(b, 1), b2: off(b, -1) };
+  }
+
+  /**
+   * Onshape's straight slot: a construction centre line, two sides and two round ends, tangent where they meet, the ends
+   * the same size and centred on the line's ends, so it stays a slot when it's dragged or dimensioned.
+   */
+  private commitSlot(at: V2) {
+    const d = this.draft;
+    if (d?.kind !== 'slot' || !d.b) return;
+    const shape = this.slotShape(d.a, d.b, at);
+    if (!shape) return;
+    const { r, a1, a2, b1, b2 } = shape;
+    const centre = { ...this.newEnt({ type: 'line', start: [...d.a] as V2, end: [...d.b] as V2 }), construction: true };
+    const side1 = this.newEnt({ type: 'line', start: a1, end: b1 });
+    const endB = this.newEnt({ type: 'arc', center: [...d.b] as V2, radius: r, start: b2, end: b1 });
+    const side2 = this.newEnt({ type: 'line', start: b2, end: a2 });
+    const endA = this.newEnt({ type: 'arc', center: [...d.a] as V2, radius: r, start: a1, end: a2 });
+    const hard: Omit<Con, 'id'>[] = [
+      { type: 'coincident', a: `${side1.id}.start`, b: `${endA.id}.start` },
+      { type: 'coincident', a: `${side1.id}.end`, b: `${endB.id}.end` },
+      { type: 'coincident', a: `${side2.id}.start`, b: `${endB.id}.start` },
+      { type: 'coincident', a: `${side2.id}.end`, b: `${endA.id}.end` },
+      { type: 'coincident', a: `${endA.id}.center`, b: `${centre.id}.start` },
+      { type: 'coincident', a: `${endB.id}.center`, b: `${centre.id}.end` },
+      { type: 'tangent', a: `${side1.id}`, b: `${endA.id}` },
+      { type: 'tangent', a: `${side1.id}`, b: `${endB.id}` },
+      { type: 'tangent', a: `${side2.id}`, b: `${endA.id}` },
+      { type: 'tangent', a: `${side2.id}`, b: `${endB.id}` },
+      { type: 'equal', a: `${endA.id}`, b: `${endB.id}` },
+    ];
+    const soft = [...this.snapCons(`${centre.id}.start`, d.snap), ...this.snapCons(`${centre.id}.end`, d.bSnap!)];
+    void this.addDrawn([centre, side1, endB, side2, endA], hard, soft);
+    this.draft = null;
+  }
+
+  /** A regular polygon's corners, from its centre and one corner. */
+  polygonCorners(c: V2, corner: V2, sides: number): V2[] {
+    const r = dist2(c, corner);
+    const t0 = angleOf(c, corner);
+    return Array.from({ length: sides }, (_, i) => [c[0] + r * Math.cos(t0 + (2 * Math.PI * i) / sides), c[1] + r * Math.sin(t0 + (2 * Math.PI * i) / sides)] as V2);
+  }
+
+  /**
+   * Onshape's inscribed polygon: its sides equal and its corners on a construction circle, so it stays regular, and
+   * turns, grows and moves as a whole.
+   */
+  private commitPolygon(corner: Snap) {
+    const d = this.draft;
+    if (d?.kind !== 'polygon') return;
+    const n = this.polygonSides[0]();
+    if (dist2(d.c, corner.p) < this.camera.worldPerPixel * 3) return;
+    const pts = this.polygonCorners(d.c, corner.p, n);
+    const ring = { ...this.newEnt({ type: 'circle', center: [...d.c] as V2, radius: dist2(d.c, corner.p) }), construction: true };
+    const sides = pts.map((p, i) => this.newEnt({ type: 'line', start: p, end: pts[(i + 1) % n] }));
+    const hard: Omit<Con, 'id'>[] = sides.map((e, i) => ({ type: 'coincident', a: `${e.id}.end`, b: `${sides[(i + 1) % n].id}.start` }));
+    for (const e of sides) hard.push({ type: 'coincident', a: `${e.id}.start`, b: `${ring.id}` });
+    for (let i = 1; i < n; i++) hard.push({ type: 'equal', a: `${sides[0].id}`, b: `${sides[i].id}` });
+    const soft = [...this.snapCons(`${ring.id}.center`, d.snap), ...this.snapCons(`${sides[0].id}.start`, corner)];
+    void this.addDrawn([ring, ...sides], hard, soft);
+    this.draft = null;
+  }
+
+  /**
+   * Onshape's sketch mirror: click the line to mirror about, then each curve to mirror, or have them selected first. The
+   * copies are tied to the originals by symmetric constraints, so they follow when the originals change.
+   */
+  private mirrorClick(sx: number, sy: number) {
+    const h = this.hit(sx, sy);
+    if (!h || !/^\d+$/.test(h)) return;
+    const id = Number(h);
+    const line = this.mirrorLine[0]();
+    if (line === null) {
+      const e = this.data.entities.find((x) => x.id === id);
+      if (e?.type !== 'line') {
+        toast('Click a line to mirror about first.');
+        return;
+      }
+      this.mirrorLine[1](id);
+      this.selection[1]([String(id)]);
+      const pending = this.mirrorPending.filter((x) => x !== id);
+      this.mirrorPending = [];
+      if (pending.length) void this.mirrorEntities(pending, id);
+      this.invalidate();
+      return;
+    }
+    if (id !== line) void this.mirrorEntities([id], line);
+  }
+
+  private mirrorEntities(ids: number[], about: number) {
+    const axis = this.data.entities.find((x) => x.id === about) as any;
+    if (!axis) return;
+    const p: V2 = axis.start, q: V2 = axis.end;
+    const len = dist2(p, q) || 1;
+    const dir: V2 = [(q[0] - p[0]) / len, (q[1] - p[1]) / len];
+    const flip = (v: V2): V2 => {
+      const t = (v[0] - p[0]) * dir[0] + (v[1] - p[1]) * dir[1];
+      const foot: V2 = [p[0] + dir[0] * t, p[1] + dir[1] * t];
+      return [2 * foot[0] - v[0], 2 * foot[1] - v[1]];
+    };
+    const ents: Ent[] = [];
+    const hard: Omit<Con, 'id'>[] = [];
+    const sym = (a: string, b: string) => hard.push({ type: 'symmetric', a, b, about: `${about}` } as any);
+    let skipped = 0;
+    for (const id of ids) {
+      const e = this.data.entities.find((x) => x.id === id) as any;
+      if (!e || isProjected(e)) { skipped++; continue; }
+      const keep = e.construction ? { construction: true } : {};
+      let c: any = null;
+      if (e.type === 'line') {
+        c = { ...this.newEnt({ type: 'line', start: flip(e.start), end: flip(e.end) } as any), ...keep };
+        sym(`${e.id}.start`, `${c.id}.start`);
+        sym(`${e.id}.end`, `${c.id}.end`);
+      } else if (e.type === 'circle') {
+        c = { ...this.newEnt({ type: 'circle', center: flip(e.center), radius: e.radius } as any), ...keep };
+        sym(`${e.id}.center`, `${c.id}.center`);
+        hard.push({ type: 'equal', a: `${e.id}`, b: `${c.id}` });
+      } else if (e.type === 'arc') {
+        // A mirror runs the other way round, so the copy's start is the original's end.
+        c = { ...this.newEnt({ type: 'arc', center: flip(e.center), radius: e.radius, start: flip(e.end), end: flip(e.start) } as any), ...keep };
+        sym(`${e.id}.center`, `${c.id}.center`);
+        sym(`${e.id}.start`, `${c.id}.end`);
+        sym(`${e.id}.end`, `${c.id}.start`);
+      } else if (e.type === 'point') {
+        c = { ...this.newEnt({ type: 'point', at: flip(e.at) } as any), ...keep };
+        sym(`${e.id}`, `${c.id}`);
+      } else skipped++;
+      if (c) ents.push(c);
+    }
+    if (skipped) toast(`${skipped === 1 ? 'One curve' : `${skipped} curves`} couldn’t be mirrored: only lines, arcs, circles and points can be, for now.`);
+    if (ents.length) return this.addDrawn(ents, hard, []);
+  }
+
+  /** Adds or takes away a side from the polygon being drawn. */
+  morePolygonSides(by: number) {
+    const [n, set] = this.polygonSides;
+    set(Math.max(3, Math.min(32, n() + by)));
+    this.invalidate();
   }
 
   /** The arc a 3-point draft would make, running counter-clockwise from its start, as arcs do. */
@@ -712,6 +1033,7 @@ export class SketchSession {
   /** Enter finishes whatever takes open-ended clicks. */
   enterKey() {
     if (this.draft?.kind === 'spline') this.commitSpline();
+    if (this.pattern[0]()?.ids.length) this.commitPattern();
     this.invalidate();
   }
 
@@ -720,7 +1042,7 @@ export class SketchSession {
     const raw = this.local(sx, sy);
     let target: Ent | null = null;
     let bestD = EDGE_HIT + 2;
-    for (const e of this.data.entities) {
+    for (const e of this.shown()) {
       if (e.type === 'point') continue;
       const c = closestOnEntity(e, raw);
       if (!c) continue;
@@ -731,7 +1053,7 @@ export class SketchSession {
     if (!target) return null;
     const e: Ent = target;
     const cuts: { p: V2; by: string }[] = [];
-    for (const o of this.data.entities) {
+    for (const o of this.shown()) {
       if (o.id === e.id || o.type === 'point') continue;
       for (const p of crossings(e, o)) cuts.push({ p, by: String(o.id) });
     }
@@ -832,7 +1154,7 @@ export class SketchSession {
     if (!h || !isPointRef(h) || h === 'origin') return toast('Click the corner where two lines meet.');
     const at = this.pointAt(h)!;
     const tol = this.camera.worldPerPixel;
-    const lines = this.data.entities.filter((e) => e.type === 'line' && !e.construction && (dist2(e.start!, at) < tol || dist2(e.end!, at) < tol));
+    const lines = this.shown().filter((e) => e.type === 'line' && !e.construction && (dist2(e.start!, at) < tol || dist2(e.end!, at) < tol));
     if (lines.length !== 2) return toast('Click the corner where two lines meet.');
     const [l1, l2] = lines;
     const endOf = (l: Ent) => (dist2(l.start!, at) < tol ? 'start' : 'end');
@@ -889,6 +1211,218 @@ export class SketchSession {
     });
   }
 
+
+  /** Adds what a tool built, with its links, as one change. */
+  private addBuilt(b: Built) {
+    return this.change((d) => {
+      d.entities.push(...b.ents);
+      d.constraints.push(...b.cons);
+      Object.assign(this.links.helpers, b.helpers);
+      this.links.hiddenCons.push(...b.hidden);
+      this.links.ties.push(...b.ties);
+    });
+  }
+
+  /** The chain of curves the offset tool would take from the one under the pointer: all it runs into end to end. */
+  private chainAt(sx: number, sy: number): Chain[] {
+    const h = this.hit(sx, sy);
+    const e = h && /^\d+$/.test(h) ? this.entity(Number(h)) : undefined;
+    if (!e || !['line', 'arc', 'circle'].includes(e.type)) return [];
+    const like = this.shown().map(drawn).filter((x) => !!x.construction === !!e.construction);
+    return chainsOf(like, this.camera.worldPerPixel * 0.5).filter((c) => c.links.some((l) => l.e.id === e.id));
+  }
+
+  /** The offset as far out as the pointer, to a round number while snapping. */
+  private offsetTo(chains: Chain[]) {
+    const raw = offsetAt(chains, this.cursor);
+    if (this.free || !snapsOn()) return raw;
+    const step = this.step();
+    return Math.sign(raw) * Math.max(step, Math.round(Math.abs(raw) / step) * step);
+  }
+
+  /** The offset's copies as they'd be now, for the preview, or why there can't be any. */
+  offsetPreview(): { ents: Omit<Ent, 'id'>[]; d: number } | string | null {
+    const d = this.draft;
+    if (d?.kind !== 'offset' || !d.d) return null;
+    const ents: Omit<Ent, 'id'>[] = [];
+    for (const c of d.chains) {
+      const pieces = offsetChain(c, d.d);
+      if (typeof pieces === 'string') return pieces;
+      ents.push(...pieces.map((p) => p.ent));
+    }
+    return { ents, d: d.d };
+  }
+
+  /**
+   * Onshape's offset: click a curve, or have some selected, and every curve it runs into end to end comes along. Then the
+   * pointer sets how far and to which side, and a click places it, with its distance open to type.
+   */
+  private offsetClick(sx: number, sy: number) {
+    const d = this.draft;
+    if (d?.kind === 'offset') {
+      if (!d.d) return;
+      const built = offsetBuild(d.chains, d.d, { ent: () => this.nextEntity++, con: () => this.nextConstraint++ });
+      if (typeof built === 'string') return toast(built);
+      this.draft = null;
+      this.offsetHover = [];
+      void this.addBuilt(built).then((ok) => {
+        if (ok && built.lead !== null) this.openEditor(built.lead, true);
+      });
+      return;
+    }
+    const chains = this.chainAt(sx, sy);
+    if (!chains.length) return toast('Click a line, an arc or a circle to offset.');
+    this.draft = { kind: 'offset', chains, d: 0 };
+  }
+
+  /** Starts an offset of what's selected, if any of it can be. */
+  private offsetSelection(): boolean {
+    const ids = new Set(this.selection[0]().filter((k) => /^\d+$/.test(k)).map(Number));
+    const picked = this.shown().map(drawn).filter((e) => ids.has(e.id) && ['line', 'arc', 'circle'].includes(e.type));
+    if (!picked.length) return false;
+    this.draft = { kind: 'offset', chains: chainsOf(picked, this.camera.worldPerPixel * 0.5), d: 0 };
+    this.selection[1]([]);
+    return true;
+  }
+
+  /**
+   * Where extending the end of a curve nearest the pointer takes it: on to the first thing it meets. A line carries
+   * straight on, and an arc round its circle.
+   */
+  extendPiece(sx: number, sy: number) {
+    const raw = this.local(sx, sy);
+    let target: Ent | null = null;
+    let bestD = EDGE_HIT + 2;
+    for (const e of this.shown()) {
+      if ((e.type !== 'line' && e.type !== 'arc') || isProjected(e)) continue;
+      const c = closestOnEntity(e, raw);
+      if (!c) continue;
+      const q = this.screen(c);
+      const d = Math.hypot(q[0] - sx, q[1] - sy);
+      if (d < bestD) { bestD = d; target = e; }
+    }
+    if (!target) return null;
+    const e: Ent = target;
+    const end: 'start' | 'end' = dist2(raw, e.start!) < dist2(raw, e.end!) ? 'start' : 'end';
+    const from = e[end]!;
+    const tiny = this.camera.worldPerPixel * 0.5;
+    let ray: Ent;
+    if (e.type === 'line') {
+      const other = end === 'end' ? e.start! : e.end!;
+      const l = dist2(from, other) || 1;
+      const u: V2 = [(from[0] - other[0]) / l, (from[1] - other[1]) / l];
+      const far = this.camera.worldPerPixel * 1e5;
+      ray = { id: -1, type: 'line', start: [from[0] + u[0] * tiny, from[1] + u[1] * tiny], end: [from[0] + u[0] * far, from[1] + u[1] * far] };
+    } else {
+      // The rest of its circle, the way it would grow.
+      ray = { id: -1, type: 'arc', center: e.center, radius: e.radius, start: e.end, end: e.start };
+    }
+    const c = e.center;
+    const howFar = (p: V2) => (e.type === 'line' ? dist2(from, p) : end === 'end' ? ccw(angleOf(c!, from), angleOf(c!, p)) : ccw(angleOf(c!, p), angleOf(c!, from)));
+    let best: { p: V2; by: string; t: number } | null = null;
+    for (const o of this.shown()) {
+      if (o.id === e.id || o.type === 'point') continue;
+      for (const p of crossings(ray, o)) {
+        const t = howFar(p);
+        if (dist2(p, from) < tiny * 2) continue;
+        if (!best || t < best.t) best = { p, by: String(o.id), t };
+      }
+    }
+    if (!best) return { e, end, to: null, polyline: [] as V2[] };
+    const polyline = e.type === 'line' ? [from, best.p] : end === 'end' ? arcPoints(c!, e.radius!, angleOf(c!, from), angleOf(c!, best.p)) : arcPoints(c!, e.radius!, angleOf(c!, best.p), angleOf(c!, from));
+    return { e, end, to: best, polyline };
+  }
+
+  private extendAt(sx: number, sy: number) {
+    const piece = this.extendPiece(sx, sy);
+    if (!piece) return;
+    const { e, end, to } = piece;
+    if (!to) return toast('Nothing is in the way of that end to extend it to.');
+    const ref = `${e.id}.${end}`;
+    const isPoint = (r: unknown) => typeof r === 'string' && (r === 'origin' || r.includes('.') || this.entity(Number(r))?.type === 'point' || isPartCorner(r));
+    const joined = this.data.constraints.some((c) => c.type === 'coincident' && ((c.a === ref && isPoint(c.b)) || (c.b === ref && isPoint(c.a))));
+    if (joined) return toast('That end is joined to another, so it can’t be extended. Trim or delete what it’s joined to first.');
+    const uses = (c: Con) => [c.a, c.b, c.of, c.about, c.point, c.line, c.what].includes(ref);
+    void this.editWithHints((d) => {
+      const x = d.entities.find((v) => v.id === e.id)!;
+      x[end] = [...to.p] as V2;
+      // Whatever held the end where it was, and a line's length, would hold it back.
+      d.constraints = d.constraints.filter((c) => !uses(c) && !(c.type === 'distance' && c.a === String(e.id) && !c.b) && !(c.type === 'angle' && c.a === String(e.id) && !c.b && e.type === 'arc'));
+    }, [{ type: 'coincident', a: ref, b: to.by }]);
+  }
+
+  /** The curves a pattern can take from what's selected. */
+  private patternIds(keys: string[]) {
+    return keys.filter((k) => /^\d+$/.test(k)).map(Number).filter((id) => {
+      const e = this.data.entities.find((x) => x.id === id);
+      return !!e && !this.hidden(id) && patternable(e);
+    });
+  }
+
+  /** A pattern's settings for what it copies, keeping any already set. */
+  private patternFor(kind: 'linear' | 'circular', ids: number[], was: PatternSetup | null): PatternSetup {
+    if (was && was.kind === kind) return { ...was, ids };
+    const pts = ids.flatMap((id) => polyline(this.entity(id)!)).concat(ids.flatMap((id) => pointsOf(this.entity(id)!).map((q) => q.p)));
+    const xs = pts.map((p) => p[0]);
+    const width = xs.length ? Math.max(...xs) - Math.min(...xs) : 0;
+    const step = this.step();
+    const dx = Math.max(step, Math.round((width * 1.5 || step * 10) / step) * step);
+    return { kind, ids, count: kind === 'linear' ? 3 : 4, dx, dy: 0, angle: 360, center: 'origin', centerAt: [0, 0] };
+  }
+
+  /** Whether the next click picks a circular pattern's center rather than more curves. */
+  readonly pickingCenter = createSignal(false);
+
+  /** In a pattern tool: a click adds or takes away a curve, or picks the center when that's asked for. */
+  private patternClick(sx: number, sy: number) {
+    const setup = this.pattern[0]();
+    if (!setup) return;
+    let h = this.hit(sx, sy);
+    if (this.pickingCenter[0]()) {
+      // The origin never moves, so it wins over anything else that happens to be on it.
+      const o = this.screen([0, 0]);
+      if (Math.hypot(o[0] - sx, o[1] - sy) < POINT_HIT) h = 'origin';
+      const at = h ? this.pointAt(h) ?? (this.entity(Number(h))?.type === 'point' ? this.entity(Number(h))!.at! : null) : null;
+      if (!h || !at || isPartRef(h)) return toast('Click a point to turn the copies about: the origin, a point, an end or a center.');
+      this.pattern[1]({ ...setup, center: h, centerAt: [...at] as V2 });
+      this.pickingCenter[1](false);
+      return;
+    }
+    if (!h || !/^\d+$/.test(h)) return;
+    const id = Number(h);
+    const e = this.entity(id);
+    if (!e || !patternable(this.data.entities.find((x) => x.id === id)!)) return toast('Lines, arcs, circles, points and splines can be patterned.');
+    const ids = setup.ids.includes(id) ? setup.ids.filter((x) => x !== id) : [...setup.ids, id];
+    this.pattern[1](this.patternFor(setup.kind, ids, setup.ids.length ? setup : null));
+    this.selection[1](ids.map(String));
+  }
+
+  /** Changes the pattern being set up. */
+  setPattern(patch: Partial<PatternSetup>) {
+    const p = this.pattern[0]();
+    if (p) this.pattern[1]({ ...p, ...patch, count: Math.max(2, Math.min(100, Math.round(patch.count ?? p.count))) });
+    this.invalidate();
+  }
+
+  /** The copies the pattern would make, for the preview. */
+  patternCopies(): Omit<Ent, 'id'>[] {
+    const p = this.pattern[0]();
+    if (!p?.ids.length) return [];
+    return patternPreview(p.ids.map((id) => this.entity(id)!).filter(Boolean), p);
+  }
+
+  /** Makes the pattern, and leaves the tool ready for another. */
+  commitPattern() {
+    const p = this.pattern[0]();
+    if (!p?.ids.length) return;
+    const ents = p.ids.map((id) => this.data.entities.find((x) => x.id === id)!).filter(Boolean);
+    const built = patternBuild(ents, p, { ent: () => this.nextEntity++, con: () => this.nextConstraint++ });
+    if (typeof built === 'string') return toast(built);
+    this.pattern[1]({ ...p, ids: [] });
+    this.selection[1]([]);
+    void this.addBuilt(built);
+  }
+
   pointerDown(sx: number, sy: number, shift: boolean) {
     // With a constraint tool on, each click picks one thing for it, and nothing gets dragged or boxed.
     if (this.constraintTool[0]()) {
@@ -917,6 +1451,16 @@ export class SketchSession {
           this.lastLabelClick = { key: h, at: now };
           if (twice) this.openEditor(conIdOf(h));
           else this.draft = { kind: 'dimdrag', id: conIdOf(h), press: [sx, sy], moved: false, editOnClick: false };
+          break;
+        }
+        // A text: twice quickly types new words, and a drag moves it by its start, its other point following.
+        const text = /^\d+$/.test(h) ? this.textOf(Number(h)) : undefined;
+        if (text) {
+          const now = performance.now();
+          const twice = this.lastLabelClick.key === h && now - this.lastLabelClick.at < 400;
+          this.lastLabelClick = { key: h, at: now };
+          if (twice) this.openTextEditor(text.id);
+          else this.draft = { kind: 'drag', grab: `${text.at}`, last: this.local(sx, sy), moved: false };
           break;
         }
         // A part's corners and edges, and what's projected from them, stay where the part puts them.
@@ -993,6 +1537,21 @@ export class SketchSession {
         else this.commitArcCenter(s);
         break;
       }
+      case 'slot': {
+        const d = this.draft;
+        const s = this.makeSnap(sx, sy);
+        if (d?.kind !== 'slot') this.draft = { kind: 'slot', a: s.p, snap: s };
+        else if (!d.b) { if (dist2(d.a, s.p) > this.camera.worldPerPixel * 3) { d.b = s.p; d.bSnap = s; } }
+        else this.commitSlot(s.p);
+        break;
+      }
+      case 'polygon': {
+        const d = this.draft;
+        const s = this.makeSnap(sx, sy);
+        if (d?.kind !== 'polygon') this.draft = { kind: 'polygon', c: s.p, snap: s };
+        else this.commitPolygon(s);
+        break;
+      }
       case 'spline': {
         const d = this.draft;
         const s = this.makeSnap(sx, sy, undefined);
@@ -1012,8 +1571,24 @@ export class SketchSession {
       case 'trim':
         this.trimAt(sx, sy);
         break;
+      case 'mirror':
+        this.mirrorClick(sx, sy);
+        break;
       case 'sketch-fillet':
         this.filletCorner(sx, sy);
+        break;
+      case 'offset':
+        this.offsetClick(sx, sy);
+        break;
+      case 'extend':
+        this.extendAt(sx, sy);
+        break;
+      case 'sketch-linear':
+      case 'sketch-circular':
+        this.patternClick(sx, sy);
+        break;
+      case 'text':
+        this.placeText(sx, sy);
         break;
       case 'point': {
         const s = this.makeSnap(sx, sy);
@@ -1034,7 +1609,7 @@ export class SketchSession {
     const d = this.draft;
     const tool = this.tool[0]();
     if (d?.kind === 'drag') {
-      if (!d.moved) this.remember(JSON.stringify(this.data));
+      if (!d.moved) this.remember(this.snapshot());
       d.moved = true;
       this.dragTo(this.cursor);
     } else if (d?.kind === 'dimdrag') {
@@ -1044,8 +1619,23 @@ export class SketchSession {
       d.b = [sx, sy];
     } else if (tool === 'select' || tool === 'dimension' || tool === 'sketch-fillet') {
       this.hover = this.hit(sx, sy);
+    } else if (tool === 'mirror') {
+      const h = this.hit(sx, sy);
+      this.hover = h && /^\d+$/.test(h) ? h : null;
     } else if (tool === 'trim') {
       this.trimming = this.trimPiece(sx, sy)?.polyline ?? null;
+    } else if (tool === 'extend') {
+      const piece = this.extendPiece(sx, sy);
+      this.extending = piece?.polyline.length ? piece.polyline : null;
+      this.hover = piece ? String(piece.e.id) : null;
+    } else if (tool === 'offset') {
+      if (d?.kind === 'offset') {
+        d.d = this.offsetTo(d.chains);
+        this.offsetHover = [];
+      } else this.offsetHover = this.chainAt(sx, sy).flatMap((c) => c.links.map((l) => l.e.id));
+    } else if (tool === 'sketch-linear' || tool === 'sketch-circular') {
+      const h = this.hit(sx, sy);
+      this.hover = h && (this.pickingCenter[0]() ? h === 'origin' || isPointRef(h) || this.entity(Number(h))?.type === 'point' : /^\d+$/.test(h)) ? h : null;
     } else {
       const from = d?.kind === 'line' ? d.start : undefined;
       this.snap = this.makeSnap(sx, sy, from);
@@ -1129,17 +1719,32 @@ export class SketchSession {
       const s = this.screen(p);
       return s[0] >= x0 && s[0] <= x1 && s[1] >= y0 && s[1] <= y1;
     };
-    const picked = this.data.entities.filter((e) => polyline(e).length ? polyline(e).every(inside) : pointsOf(e).every((q) => inside(q.p))).map((e) => String(e.id));
+    const picked = this.shown().filter((e) => polyline(e).length ? polyline(e).every(inside) : pointsOf(e).every((q) => inside(q.p))).map((e) => String(e.id));
     this.selection[1]([...new Set([...this.selection[0](), ...picked])]);
   }
 
   setTool(t: Tool) {
+    // Mirror takes what's selected as what to mirror, once the line is clicked.
+    this.mirrorPending = t === 'mirror' ? this.selection[0]().filter((r) => /^\d+$/.test(r)).map(Number) : [];
+    this.mirrorLine[1](null);
+    if (t === 'mirror') this.selection[1]([]);
     this.draft = null;
     this.snap = null;
     this.trimming = null;
+    this.extending = null;
+    this.offsetHover = [];
     this.hover = null;
     this.constraintTool[1](null);
+    this.pickingCenter[1](false);
+    // A pattern starts from what's selected, and the selection then shows what it copies.
+    if (t === 'sketch-linear' || t === 'sketch-circular') {
+      const ids = this.patternIds(this.selection[0]());
+      this.pattern[1](this.patternFor(t === 'sketch-linear' ? 'linear' : 'circular', ids, null));
+      this.selection[1](ids.map(String));
+    } else this.pattern[1](null);
     this.tool[1](t);
+    // Offset takes what's selected, and goes straight to how far.
+    if (t === 'offset') this.offsetSelection();
     this.invalidate();
   }
 
@@ -1147,8 +1752,27 @@ export class SketchSession {
   escape(): boolean {
     this.snap = null;
     this.invalidate();
+    if (this.tool[0]() === 'mirror' && this.mirrorLine[0]() !== null) {
+      this.mirrorLine[1](null);
+      this.selection[1]([]);
+      return true;
+    }
     if (this.editing[0]()) {
       this.editing[1](null);
+      return true;
+    }
+    if (this.textEditing[0]()) {
+      this.textEditing[1](null);
+      return true;
+    }
+    if (this.pickingCenter[0]()) {
+      this.pickingCenter[1](false);
+      return true;
+    }
+    const pattern = this.pattern[0]();
+    if (pattern?.ids.length) {
+      this.pattern[1]({ ...pattern, ids: [] });
+      this.selection[1]([]);
       return true;
     }
     if (this.draft) {
@@ -1180,14 +1804,88 @@ export class SketchSession {
     const ents = new Set(keys.filter((k) => !isConstraintKey(k) && !k.includes('.') && /^\d+$/.test(k)).map(Number));
     // Selecting one end of a line or a circle's center means the whole thing, when deleting.
     for (const k of keys) if (k.includes('.')) ents.add(Number(k.split('.')[0]));
+    // A text goes with either of its points, and they with it.
+    for (const t of this.texts()) if (ents.has(t.id) || ents.has(t.at) || ents.has(t.up)) [t.id, t.at, t.up].forEach((x) => ents.add(x));
     if (!cons.size && !ents.size) return;
     const uses = (c: Con) =>
       [c.a, c.b, c.of, c.about, c.point, c.line, c.what].some((r) => typeof r === 'string' && ents.has(Number(r.split('.')[0])));
     void this.change((d) => {
       d.entities = d.entities.filter((e) => !ents.has(e.id));
       d.constraints = d.constraints.filter((c) => !cons.has(c.id) && !uses(c));
+      if (d.texts) d.texts = (d.texts as SketchText[]).filter((t) => !ents.has(t.id));
     });
     this.selection[1]([]);
+  }
+
+  /**
+   * Copies what's selected, with the constraints and dimensions between those things, for pasting into this sketch or
+   * another, as Onshape's sketch copy does. A point or end selected brings its whole curve.
+   */
+  copySelection(): boolean {
+    const keys = this.selection[0]();
+    const ids = new Set<number>();
+    for (const k of keys) if (/^\d+(\.\w+)?$/.test(k)) ids.add(Number(k.split('.')[0]));
+    // A text comes with the two points that place it, and either point brings its text.
+    const texts = this.texts().filter((t) => ids.has(t.id) || ids.has(t.at) || ids.has(t.up));
+    for (const t of texts) ids.add(t.at).add(t.up);
+    const ents = this.data.entities.filter((e) => ids.has(e.id) && !isProjected(e));
+    if (!ents.length) return false;
+    const kept = new Set(ents.map((e) => e.id));
+    const REF_FIELDS = ['a', 'b', 'of', 'about', 'point', 'line', 'what'] as const;
+    // Only constraints that are wholly among what's copied: one to the origin or a part would pin the copy back.
+    const cons = this.data.constraints.filter((c) => {
+      const refs = REF_FIELDS.map((f) => c[f]).filter((r): r is string => typeof r === 'string');
+      return refs.length > 0 && refs.every((r) => /^\d+(\.\w+)?$/.test(r) && kept.has(Number(r.split('.')[0])));
+    });
+    // Its middle as it shows, letters and all, for a paste to centre on the pointer.
+    const shown = [...ents.flatMap((e) => pointsOf(e).map((p) => p.p)), ...texts.flatMap((t) => (this.textOutlines.get(t.id) ?? []).flat())];
+    const xs = shown.map((p) => p[0]), ys = shown.map((p) => p[1]);
+    const middle: V2 = [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+    sketchClipboard = JSON.parse(JSON.stringify({ ents, cons, texts, middle }));
+    const placing = new Set(texts.flatMap((t) => [t.at, t.up]));
+    const curves = ents.filter((e) => !placing.has(e.id)).length;
+    const what = [curves ? (curves === 1 ? 'one curve' : `${curves} curves`) : '', texts.length ? (texts.length === 1 ? 'one text' : `${texts.length} texts`) : ''].filter(Boolean).join(' and ');
+    toast(`Copied ${what}. Ctrl V pastes ${curves + texts.length === 1 ? 'it' : 'them'} at the pointer.`);
+    return true;
+  }
+
+  /** Pastes what was copied, centred on the pointer, with new ids, and selects it so it can be dragged into place. */
+  pasteClipboard(): boolean {
+    const clip = sketchClipboard;
+    if (!clip) return false;
+    const pts = clip.ents.flatMap((e) => pointsOf(e).map((p) => p.p));
+    if (!pts.length) return false;
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    const middle = clip.middle ?? [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+    const dx = this.cursor[0] - middle[0];
+    const dy = this.cursor[1] - middle[1];
+    const move = (v: unknown) => (Array.isArray(v) && v.length === 2 && v.every((n) => typeof n === 'number') ? [v[0] + dx, v[1] + dy] : v);
+    const ids = new Map<number, number>();
+    const ents = clip.ents.map((e) => {
+      const copy: any = { ...JSON.parse(JSON.stringify(e)), id: this.nextEntity++ };
+      ids.set(e.id, copy.id);
+      for (const k of ['start', 'end', 'center', 'at']) if (k in copy) copy[k] = move(copy[k]);
+      if (Array.isArray(copy.points)) copy.points = copy.points.map(move);
+      return copy as Ent;
+    });
+    const remap = (r: unknown) => {
+      if (typeof r !== 'string') return r;
+      const [id, part] = r.split('.');
+      return `${ids.get(Number(id)) ?? id}${part ? `.${part}` : ''}`;
+    };
+    const cons = clip.cons.map((c) => {
+      const copy: any = { ...JSON.parse(JSON.stringify(c)), id: this.nextConstraint++ };
+      for (const k of ['a', 'b', 'of', 'about', 'point', 'line', 'what']) if (k in copy) copy[k] = remap(copy[k]);
+      return copy as Con;
+    });
+    const texts = (clip.texts ?? []).map((t) => ({ ...t, id: this.nextEntity++, at: ids.get(t.at) ?? t.at, up: ids.get(t.up) ?? t.up }));
+    const placing = new Set(texts.flatMap((t) => [t.at, t.up]));
+    void this.change((d) => {
+      d.entities.push(...ents);
+      d.constraints.push(...cons);
+      if (texts.length) d.texts = [...((d.texts ?? []) as SketchText[]), ...texts];
+    }).then(() => this.selection[1]([...ents.filter((e) => !placing.has(e.id)).map((e) => String(e.id)), ...texts.map((t) => String(t.id))]));
+    return true;
   }
 
   /** Turns what's selected into construction geometry or back, or with nothing selected, whether new lines come out that way. */
@@ -1495,6 +2193,7 @@ export class SketchSession {
     this.editing[1](null);
     const typed = numberOr(text);
     if (typed === '') return;
+    const hold = this.links.ties.find((t) => t.lead === id)?.hold;
     void this.change((d) => {
       const c = d.constraints.find((x) => x.id === id);
       if (!c) return;
@@ -1506,6 +2205,6 @@ export class SketchSession {
         const size = bareExpression(typed.replace(/^-\s*(?=[\w(])/, ''));
         c.value = sign < 0 ? `-(${size})` : size;
       }
-    });
+    }, { hold });
   }
 }
